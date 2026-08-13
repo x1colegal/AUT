@@ -19,5 +19,8 @@
         <item name="strokeWidth">0dp</item>
     </style>
 
-    <style name="AccessoryDispatchTheme" parent="android:style/Theme.NoDisplay" />
+    <style name="AccessoryDispatchTheme" parent="android:style/Theme.NoDisplay">
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
 </resources>

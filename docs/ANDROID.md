@@ -126,8 +126,10 @@ foreground, regardless of whether AUT is active. The screen opens only through
 explicit user interaction, such as the launcher icon or notification. Opening
 the app manually restores the persisted running
 status and Direct/RATP selection instead of presenting an idle “choose a mode”
-state. Clearing activity history removes only old entries and preserves the
-current connection status.
+state. The dispatcher runs in its own no-animation task and removes that task
+immediately, so finishing an attachment event cannot reveal a previously
+stacked control screen. Clearing activity history removes only old entries and
+preserves the current connection status.
 
 The latest 80 activity entries are persisted in app preferences. Closing and
 reopening the activity does not erase them. **Clear history** removes activity

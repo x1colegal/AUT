@@ -7,6 +7,7 @@ import android.os.Bundle;
 public final class AccessoryAttachActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        finish();
+        finishAndRemoveTask();
+        overridePendingTransition(0, 0);
     }
 }
