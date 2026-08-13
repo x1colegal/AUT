@@ -112,9 +112,16 @@ without another user tap. Failed attempts retry immediately with no backoff.
 Only an explicit **Stop AUT**, a mode change, or revoked VPN permission cancels
 the current recovery cycle.
 
-AOA re-enumeration is received by a no-display attachment dispatcher. When AUT
-is already active, reconnecting USB does not launch or bring the control screen
-to the foreground. Opening the app manually restores the persisted running
+The first failure in one outage records exactly `Lost Connection. Retrying!`.
+Further immediate attempts stay silent: they do not append history, broadcast
+UI events, or update the notification repeatedly. Normal status publishing
+resumes only after the connection becomes active again or the user stops AUT.
+
+AOA re-enumeration is received by a no-display attachment dispatcher. USB
+attachment and reconnection never launch or bring the control screen to the
+foreground, regardless of whether AUT is active. The screen opens only through
+explicit user interaction, such as the launcher icon or notification. Opening
+the app manually restores the persisted running
 status and Direct/RATP selection instead of presenting an idle “choose a mode”
 state. Clearing activity history removes only old entries and preserves the
 current connection status.

@@ -70,7 +70,7 @@ public final class AutVpnService extends VpnService {
 
     private volatile boolean running;
     private volatile boolean desiredActive;
-    private int reconnectAttempt;
+    private volatile boolean reconnecting;
     private ScheduledExecutorService reconnectExecutor;
     private ScheduledFuture<?> reconnectFuture;
     private boolean pingEnabled;
@@ -108,6 +108,7 @@ public final class AutVpnService extends VpnService {
         }
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             desiredActive = false;
+            reconnecting = false;
             cancelReconnect();
             getPreferences().edit().putBoolean(PREF_ACTIVE, false).apply();
             status("AUT stopped");
@@ -115,8 +116,8 @@ public final class AutVpnService extends VpnService {
             return START_NOT_STICKY;
         }
         desiredActive = true;
+        reconnecting = false;
         cancelReconnect();
-        reconnectAttempt = 0;
         if (running) shutdown(true);
         String mode = intent == null
                 ? getPreferences().getString(PREF_MODE, MODE_INTERNET)
@@ -644,12 +645,8 @@ public final class AutVpnService extends VpnService {
     }
 
     private void status(String message) {
-        getPreferences().edit().putString(PREF_RUNTIME_STATUS, message).apply();
-        AutEventLog.append(this, message);
-        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
-                .notify(NOTIFICATION_ID, notification(message));
-        sendBroadcast(new Intent(ACTION_STATUS).setPackage(getPackageName())
-                .putExtra(EXTRA_STATUS, message));
+        if (reconnecting) return;
+        publishStatus(message);
     }
 
     private synchronized void fail(String message, int generation) {
@@ -663,14 +660,17 @@ public final class AutVpnService extends VpnService {
     }
 
     private void connectionLost(String message, int generation) {
+        boolean announceLoss;
         synchronized (this) {
             if (!isCurrent(generation) || !desiredActive) return;
+            announceLoss = !reconnecting;
+            reconnecting = true;
             running = false;
             handshakeComplete = false;
             clientReadyAcknowledged = false;
             sessionGeneration.incrementAndGet();
         }
-        status(message + " — reconnecting automatically");
+        if (announceLoss) publishStatus("Lost Connection. Retrying!");
         new Thread(() -> {
             cleanupSession(false);
             scheduleReconnect();
@@ -679,7 +679,6 @@ public final class AutVpnService extends VpnService {
 
     private synchronized void scheduleReconnect() {
         if (!desiredActive || reconnectExecutor == null || reconnectExecutor.isShutdown()) return;
-        reconnectAttempt++;
         cancelReconnect();
         reconnectFuture = reconnectExecutor.schedule(() -> {
             synchronized (AutVpnService.this) {
@@ -688,8 +687,6 @@ public final class AutVpnService extends VpnService {
                 running = true;
             }
             int generation = sessionGeneration.incrementAndGet();
-            status("Reconnect attempt " + reconnectAttempt + " · "
-                    + transportProtocol.toUpperCase(Locale.US));
             startTransportSafely(generation);
         }, 0, TimeUnit.MILLISECONDS);
     }
@@ -700,8 +697,18 @@ public final class AutVpnService extends VpnService {
     }
 
     private synchronized void markConnectionStable() {
-        if (reconnectAttempt > 0) status("AUT connection restored automatically");
-        reconnectAttempt = 0;
+        boolean wasReconnecting = reconnecting;
+        reconnecting = false;
+        if (wasReconnecting) publishStatus("AUT connection restored automatically");
+    }
+
+    private void publishStatus(String message) {
+        getPreferences().edit().putString(PREF_RUNTIME_STATUS, message).apply();
+        AutEventLog.append(this, message);
+        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
+                .notify(NOTIFICATION_ID, notification(message));
+        sendBroadcast(new Intent(ACTION_STATUS).setPackage(getPackageName())
+                .putExtra(EXTRA_STATUS, message));
     }
 
     private void shutdownAsync(boolean notifyPeer) {
@@ -791,6 +798,7 @@ public final class AutVpnService extends VpnService {
 
     @Override public void onRevoke() {
         desiredActive = false;
+        reconnecting = false;
         cancelReconnect();
         getPreferences().edit().putBoolean(PREF_ACTIVE, false).apply();
         status("VPN permission revoked");
