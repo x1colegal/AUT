@@ -116,6 +116,9 @@ The first failure in one outage records exactly `Lost Connection. Retrying!`.
 Further immediate attempts stay silent: they do not append history, broadcast
 UI events, or update the notification repeatedly. Normal status publishing
 resumes only after the connection becomes active again or the user stops AUT.
+The established Android TUN remains open throughout this USB recovery cycle;
+only the failed USB session is replaced, so Android keeps the VPN active while
+AUT negotiates the next connection.
 
 AOA re-enumeration is received by a no-display attachment dispatcher. USB
 attachment and reconnection never launch or bring the control screen to the

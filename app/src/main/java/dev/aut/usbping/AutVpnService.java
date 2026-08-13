@@ -357,6 +357,7 @@ public final class AutVpnService extends VpnService {
             } else {
                 clientReadyAcknowledged = false;
                 sendClientReady(generation);
+                resumeSessionTasks(generation);
             }
         } else if (frame.type == AutProtocol.CONFIG_REQUIRED && internetEnabled) {
             status("USB session restored — renewing the AUT lease");
@@ -436,8 +437,15 @@ public final class AutVpnService extends VpnService {
                 500, 500, TimeUnit.MILLISECONDS);
         scheduler.scheduleWithFixedDelay(() -> sendIcmp6Ping(generation),
                 0, 1, TimeUnit.SECONDS);
-        new Thread(() -> tunLoop(generation), "aut-tun-reader").start();
+        new Thread(this::tunLoop, "aut-tun-reader").start();
         status("TUN ready · waiting for the Linux gateway · " + packetPathDescription());
+    }
+
+    private void resumeSessionTasks(int generation) {
+        scheduler.scheduleWithFixedDelay(() -> sendClientReady(generation),
+                500, 500, TimeUnit.MILLISECONDS);
+        scheduler.scheduleWithFixedDelay(() -> sendIcmp6Ping(generation),
+                0, 1, TimeUnit.SECONDS);
     }
 
     private String packetPathDescription() {
@@ -452,20 +460,23 @@ public final class AutVpnService extends VpnService {
         sendFrame(AutProtocol.CLIENT_READY, new byte[0], generation);
     }
 
-    private void tunLoop(int generation) {
+    private void tunLoop() {
         byte[] packet = new byte[65535];
+        FileInputStream input = tunInput;
         try {
-            while (isCurrent(generation)) {
-                int count = tunInput.read(packet);
+            while (desiredActive && input == tunInput) {
+                int count = input.read(packet);
                 if (count < 0) throw new IOException("end of TUN stream");
-                if (!isCurrent(generation)) break;
+                int generation = sessionGeneration.get();
+                if (!isCurrent(generation)) continue;
                 byte[] copy = new byte[count];
                 System.arraycopy(packet, 0, copy, 0, count);
                 sendIpToUsb(copy, generation);
             }
         } catch (IOException error) {
-            if (isCurrent(generation)) {
-                connectionLost("VPN I/O error: " + usefulMessage(error), generation);
+            int generation = sessionGeneration.get();
+            if (desiredActive && input == tunInput && isCurrent(generation)) {
+                fail("VPN I/O error: " + usefulMessage(error), generation);
             }
         }
     }
@@ -672,7 +683,7 @@ public final class AutVpnService extends VpnService {
         }
         if (announceLoss) publishStatus("Lost Connection. Retrying!");
         new Thread(() -> {
-            cleanupSession(false);
+            cleanupUsbSession();
             scheduleReconnect();
         }, "aut-reconnect-cleanup").start();
     }
@@ -750,20 +761,24 @@ public final class AutVpnService extends VpnService {
     }
 
     private synchronized void cleanupSession(boolean removeForeground) {
-        if (scheduler != null) scheduler.shutdownNow();
-        scheduler = null;
+        cleanupUsbSession();
         close(tunInput); close(tunOutput); close(tunFd);
-        close(usbInput); close(usbOutput); close(accessoryFd);
         tunInput = null; tunOutput = null; tunFd = null;
-        usbInput = null; usbOutput = null; accessoryFd = null;
-        pings.clear();
-        icmp6Pings.clear();
         clientIpv6 = null;
         gatewayIpv6 = null;
         if (removeForeground) {
             if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
             else stopForeground(true);
         }
+    }
+
+    private synchronized void cleanupUsbSession() {
+        if (scheduler != null) scheduler.shutdownNow();
+        scheduler = null;
+        close(usbInput); close(usbOutput); close(accessoryFd);
+        usbInput = null; usbOutput = null; accessoryFd = null;
+        pings.clear();
+        icmp6Pings.clear();
     }
 
     private static String usefulMessage(Exception error) {
