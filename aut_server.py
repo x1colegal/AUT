@@ -30,11 +30,12 @@ except ImportError:
     raise SystemExit(2)
 
 from aut_protocol import (
+    ControlRecord,
     Decoder,
     Frame,
     HandshakeDecoder,
     ProtocolError,
-    RtcpDecoder,
+    RatpEngine,
     TYPE_CONFIG_REQUEST,
     TYPE_CONFIG_REQUIRED,
     TYPE_CLIENT_READY,
@@ -45,12 +46,10 @@ from aut_protocol import (
     TYPE_PING,
     TYPE_PONG,
     TYPE_SESSION_STOP,
-    TYPE_RTCP_DATA,
-    TYPE_RUDP_PACKET,
+    TYPE_RATP_DATA,
     FLAG_END_MESSAGE,
     encode,
     encode_handshake_response,
-    encode_rtcp_packet,
     negotiate_request,
 )
 
@@ -582,7 +581,7 @@ class ClientSession:
         self.connection = connection
         self.decoder = Decoder()
         self.handshake_decoder = HandshakeDecoder()
-        self.rtcp_decoder = RtcpDecoder()
+        self.ratp = RatpEngine()
         self.handshake_complete = False
         self.transport = "direct"
         self.client_id: str | None = None
@@ -597,6 +596,7 @@ class ClientSession:
         self.protocol_active = False
         self.pending_packets: list[bytes] = []
         self.icmp6_replies = 0
+        self.maintenance_running = False
 
     @property
     def label(self) -> str:
@@ -606,20 +606,12 @@ class ClientSession:
 
     def next_frame(self, frame_type: int, payload: bytes = b"", flags: int = 0) -> Frame:
         frame = Frame(frame_type, self.sequence, time.monotonic_ns(), payload, flags)
-        self.sequence = (self.sequence + 1) & 0x7FFF_FFFF
+        self.sequence = self.sequence % 0x7FFF_FFFF + 1
         return frame
 
     def ip_frames(self, packet: bytes) -> list[Frame]:
-        if self.transport == "rudp":
-            return [self.next_frame(TYPE_RUDP_PACKET, packet, FLAG_END_MESSAGE)]
-        if self.transport == "rtcp":
-            stream = encode_rtcp_packet(packet)
-            frames = []
-            for offset in range(0, len(stream), 16 * 1024):
-                end = min(offset + 16 * 1024, len(stream))
-                flags = FLAG_END_MESSAGE if end == len(stream) else 0
-                frames.append(self.next_frame(TYPE_RTCP_DATA, stream[offset:end], flags))
-            return frames
+        if self.transport == "ratp":
+            return [self.ratp.send_packet(packet)]
         return [self.next_frame(TYPE_IP_PACKET, packet, FLAG_END_MESSAGE)]
 
     def write_control(self, frame: Frame) -> bool:
@@ -650,6 +642,12 @@ class ClientSession:
 
     def run(self) -> None:
         print(f"[{self.label}] USB accessory ready; waiting for the AUT app", flush=True)
+        self.maintenance_running = True
+        threading.Thread(
+            target=self._maintenance_loop,
+            name=f"aut-ratp-{self.key[0]}-{self.key[1]}",
+            daemon=True,
+        ).start()
         try:
             while True:
                 try:
@@ -666,6 +664,7 @@ class ClientSession:
             if not self.server.stopping:
                 print(f"[{self.label}] disconnected: {error}", flush=True)
         finally:
+            self.maintenance_running = False
             self.server.gateway.unregister(self)
             try:
                 self.connection.close()
@@ -684,7 +683,7 @@ class ClientSession:
                 continue
 
             active_decoder = self.decoder
-            frames = active_decoder.feed(pending, max_frames=1)
+            frames = active_decoder.feed(pending, max_records=1)
             pending = b""
             if not frames:
                 return
@@ -693,6 +692,23 @@ class ClientSession:
             # the same USB read. Drain the decoder that parsed this frame,
             # even when handle() has already installed a fresh decoder.
             pending = active_decoder.take_pending()
+
+    def _maintenance_loop(self) -> None:
+        while self.maintenance_running:
+            try:
+                if self.handshake_complete and self.transport == "ratp":
+                    self._write_ratp_work(self.ratp.maintenance())
+            except (ProtocolError, usb.core.USBError, OSError) as error:
+                if self.maintenance_running and not self.server.stopping:
+                    print(f"[{self.label}] RATP maintenance stopped: {error}", flush=True)
+                return
+            time.sleep(0.005)
+
+    def _write_ratp_work(self, work) -> None:
+        for control in work.controls:
+            self.connection.write_raw(control)
+        if work.retransmissions:
+            self.connection.write_frames(work.retransmissions)
 
     def accept_handshake(self, first_line: str, options: dict[str, str]) -> None:
         try:
@@ -715,8 +731,7 @@ class ClientSession:
             "Framing": "binary-h2; accepted",
             "Mode": f"{options.get('mode', 'unspecified')}; accepted",
             "Rejected-Options": ", ".join(rejected) if rejected else "none",
-            "RUDP": "supported",
-            "RTCP": "supported",
+            "RATP": "window=1024; sack; ack+nack; adaptive-rto; ordered",
         }))
         self.handshake_complete = True
         self.protocol_active = True
@@ -725,7 +740,14 @@ class ClientSession:
             flush=True,
         )
 
-    def handle(self, frame: Frame) -> None:
+    def handle(self, frame: Frame | ControlRecord) -> None:
+        if isinstance(frame, ControlRecord):
+            if self.transport != "ratp":
+                raise ProtocolError("RATP ACK/NACK was not negotiated")
+            retransmissions = self.ratp.handle_control(frame)
+            if retransmissions:
+                self.connection.write_frames(retransmissions)
+            return
         if frame.type == TYPE_PING:
             self.write_control(
                 Frame(TYPE_PONG, frame.sequence, frame.timestamp_ns,
@@ -788,15 +810,12 @@ class ClientSession:
                     f"[{self.label}] ICMPv6 Echo Reply={self.icmp6_replies}",
                     flush=True,
                 )
-        elif frame.type in (TYPE_IP_PACKET, TYPE_RUDP_PACKET, TYPE_RTCP_DATA):
-            if frame.type == TYPE_RUDP_PACKET and self.transport != "rudp":
-                raise ProtocolError("RUDP frame was not negotiated")
-            if frame.type == TYPE_RTCP_DATA and self.transport != "rtcp":
-                raise ProtocolError("RTCP frame was not negotiated")
-            if frame.type == TYPE_IP_PACKET and self.transport in ("rudp", "rtcp"):
-                raise ProtocolError("plain IP frame does not match negotiated transport")
-            packets = (self.rtcp_decoder.feed(frame.payload)
-                       if frame.type == TYPE_RTCP_DATA else [frame.payload])
+        elif frame.type in (TYPE_IP_PACKET, TYPE_RATP_DATA):
+            if frame.type == TYPE_RATP_DATA and self.transport != "ratp":
+                raise ProtocolError("RATP_DATA was not negotiated")
+            if frame.type == TYPE_IP_PACKET and self.transport == "ratp":
+                raise ProtocolError("plain IP frame does not match negotiated RATP")
+            packets = self.ratp.receive(frame) if frame.type == TYPE_RATP_DATA else [frame.payload]
             for packet in packets:
                 self.handle_ip_packet(packet)
         elif frame.type == TYPE_SESSION_STOP:
@@ -814,7 +833,7 @@ class ClientSession:
         self.server.gateway.unregister(self)
         self.decoder = Decoder()
         self.handshake_decoder = HandshakeDecoder()
-        self.rtcp_decoder = RtcpDecoder()
+        self.ratp = RatpEngine()
         self.handshake_complete = False
         self.protocol_active = False
         self.transport = "direct"

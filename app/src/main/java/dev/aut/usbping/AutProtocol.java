@@ -7,11 +7,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-/** AUT/4 cleartext negotiation and HTTP/2-inspired binary framing. */
+/** AUT/4 handshake, binary framing, and cleartext RATP controls. */
 final class AutProtocol {
     static final String VERSION = "4.0";
     static final byte PING = 1;
@@ -24,13 +25,14 @@ final class AutProtocol {
     static final byte CLIENT_READY = 8;
     static final byte CLIENT_READY_ACK = 9;
     static final byte ICMP6_ECHO = 10;
-    static final byte RUDP_PACKET = 11;
-    static final byte RTCP_DATA = 12;
+    static final byte RATP_DATA = 11;
     static final byte END_MESSAGE = 1;
     static final int HEADER_SIZE = 9;
     static final int METADATA_SIZE = 8;
     static final int MAX_PAYLOAD = 65536;
     static final int MAX_HANDSHAKE = 8192;
+    static final int MAX_CONTROL_SEQUENCES = 256;
+    static final int MAX_CONTROL_LINE = 2400;
 
     private AutProtocol() {}
 
@@ -43,7 +45,7 @@ final class AutProtocol {
         if (payload.length > MAX_PAYLOAD) {
             throw new IllegalArgumentException("payload is too large");
         }
-        if (sequence < 0) throw new IllegalArgumentException("sequence is out of range");
+        if (sequence <= 0) throw new IllegalArgumentException("sequence is out of range");
         int length = METADATA_SIZE + payload.length;
         ByteBuffer frame = ByteBuffer.allocate(HEADER_SIZE + length).order(ByteOrder.BIG_ENDIAN);
         frame.put((byte) (length >>> 16));
@@ -55,6 +57,29 @@ final class AutProtocol {
         frame.putLong(timestampNanos);
         frame.put(payload);
         return frame.array();
+    }
+
+    static byte[] encode(Frame frame) {
+        return encode(frame.type, frame.flags, frame.sequence, frame.timestampNanos, frame.payload);
+    }
+
+    static byte[] controlLine(String kind, Iterable<Integer> values) {
+        if (!"ACK".equals(kind) && !"NACK".equals(kind)) {
+            throw new IllegalArgumentException("control kind must be ACK or NACK");
+        }
+        LinkedHashSet<Integer> unique = new LinkedHashSet<>();
+        for (int value : values) unique.add(value);
+        if (unique.isEmpty() || unique.size() > MAX_CONTROL_SEQUENCES) {
+            throw new IllegalArgumentException("control line must contain 1 through 256 sequences");
+        }
+        StringBuilder line = new StringBuilder(kind).append(' ');
+        int index = 0;
+        for (int value : unique) {
+            if (value <= 0) throw new IllegalArgumentException("control sequence is out of range");
+            if (index++ > 0) line.append(',');
+            line.append(String.format(Locale.US, "%08X", value));
+        }
+        return line.append("\r\n").toString().getBytes(StandardCharsets.US_ASCII);
     }
 
     static byte[] handshakeRequest(String transport, String mode) {
@@ -82,15 +107,41 @@ final class AutProtocol {
         }
     }
 
-    static final class Decoder {
+    static final class ControlRecord {
+        final String kind;
+        final int[] sequences;
+
+        ControlRecord(String kind, int[] sequences) {
+            this.kind = kind;
+            this.sequences = sequences;
+        }
+    }
+
+    /** Mixed decoder: binary frames and raw ASCII ACK/NACK lines share USB. */
+    static final class WireDecoder {
         private final ByteArrayOutputStream pending = new ByteArrayOutputStream();
 
-        synchronized List<Frame> feed(byte[] bytes, int count) throws ProtocolException {
+        synchronized List<Object> feed(byte[] bytes, int count) throws ProtocolException {
             pending.write(bytes, 0, count);
             byte[] data = pending.toByteArray();
             int offset = 0;
-            List<Frame> frames = new ArrayList<>();
-            while (data.length - offset >= HEADER_SIZE) {
+            List<Object> records = new ArrayList<>();
+            while (offset < data.length) {
+                int first = data[offset] & 0xff;
+                if (first == 'A' || first == 'N') {
+                    int marker = findCrlf(data, offset);
+                    if (marker < 0) {
+                        if (data.length - offset > MAX_CONTROL_LINE) {
+                            throw new ProtocolException("RATP control line is too large");
+                        }
+                        break;
+                    }
+                    records.add(parseControl(new String(
+                            data, offset, marker - offset, StandardCharsets.US_ASCII)));
+                    offset = marker + 2;
+                    continue;
+                }
+                if (data.length - offset < HEADER_SIZE) break;
                 int length = ((data[offset] & 0xff) << 16)
                         | ((data[offset + 1] & 0xff) << 8) | (data[offset + 2] & 0xff);
                 if (length < METADATA_SIZE || length > MAX_PAYLOAD + METADATA_SIZE) {
@@ -103,16 +154,52 @@ final class AutProtocol {
                 byte type = header.get();
                 byte flags = header.get();
                 int sequence = header.getInt();
-                if (sequence < 0) throw new ProtocolException("reserved stream-id bit is set");
+                if (sequence <= 0) throw new ProtocolException("invalid or reserved stream ID");
                 long timestamp = header.getLong();
                 byte[] payload = Arrays.copyOfRange(
                         data, offset + HEADER_SIZE + METADATA_SIZE, offset + frameLength);
-                frames.add(new Frame(type, flags, sequence, timestamp, payload));
+                records.add(new Frame(type, flags, sequence, timestamp, payload));
                 offset += frameLength;
             }
             pending.reset();
             pending.write(data, offset, data.length - offset);
-            return frames;
+            return records;
+        }
+
+        private static ControlRecord parseControl(String line) throws ProtocolException {
+            int space = line.indexOf(' ');
+            if (space < 0) throw new ProtocolException("invalid RATP control line");
+            String kind = line.substring(0, space);
+            if (!"ACK".equals(kind) && !"NACK".equals(kind)) {
+                throw new ProtocolException("invalid RATP control kind");
+            }
+            String[] tokens = line.substring(space + 1).split(",", -1);
+            if (tokens.length == 0 || tokens.length > MAX_CONTROL_SEQUENCES) {
+                throw new ProtocolException("invalid RATP control sequence count");
+            }
+            int[] sequences = new int[tokens.length];
+            try {
+                for (int i = 0; i < tokens.length; i++) {
+                    if (tokens[i].length() != 8) {
+                        throw new ProtocolException("invalid RATP control sequence");
+                    }
+                    long parsed = Long.parseLong(tokens[i], 16);
+                    if (parsed <= 0 || parsed > 0x7fffffffL) {
+                        throw new ProtocolException("invalid RATP control sequence");
+                    }
+                    sequences[i] = (int) parsed;
+                }
+            } catch (NumberFormatException error) {
+                throw new ProtocolException("invalid RATP control sequence");
+            }
+            return new ControlRecord(kind, sequences);
+        }
+
+        private static int findCrlf(byte[] data, int offset) {
+            for (int i = offset; i + 1 < data.length; i++) {
+                if (data[i] == '\r' && data[i + 1] == '\n') return i;
+            }
+            return -1;
         }
     }
 
@@ -170,36 +257,6 @@ final class AutProtocol {
             }
             return -1;
         }
-    }
-
-    static final class RtcpDecoder {
-        private final ByteArrayOutputStream pending = new ByteArrayOutputStream();
-
-        synchronized List<byte[]> feed(byte[] bytes) throws ProtocolException {
-            pending.write(bytes, 0, bytes.length);
-            byte[] data = pending.toByteArray();
-            int offset = 0;
-            List<byte[]> packets = new ArrayList<>();
-            while (data.length - offset >= 2) {
-                int length = ((data[offset] & 0xff) << 8) | (data[offset + 1] & 0xff);
-                if (length == 0) throw new ProtocolException("zero-length RTCP packet");
-                if (data.length - offset < length + 2) break;
-                packets.add(Arrays.copyOfRange(data, offset + 2, offset + 2 + length));
-                offset += 2 + length;
-            }
-            pending.reset();
-            pending.write(data, offset, data.length - offset);
-            return packets;
-        }
-    }
-
-    static byte[] rtcpPacket(byte[] packet) {
-        if (packet.length == 0 || packet.length > 65535) {
-            throw new IllegalArgumentException("RTCP packet length is out of range");
-        }
-        ByteBuffer framed = ByteBuffer.allocate(packet.length + 2).order(ByteOrder.BIG_ENDIAN);
-        framed.putShort((short) packet.length).put(packet);
-        return framed.array();
     }
 
     static final class ProtocolException extends Exception {

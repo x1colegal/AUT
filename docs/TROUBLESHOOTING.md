@@ -116,12 +116,6 @@ Linux should report:
 If Android sends but Linux never prints a reply, verify the Python server was
 restarted after updating `aut_server.py`.
 
-## TCP path reports `could not protect connected TCP loopback socket`
-
-Some Android kernels reject `VpnService.protect()` for a TCP socket connected
-to loopback. This is device-specific. Select **Direct** or **UDP**; Direct is the
-recommended production path.
-
 ## Android reports that AUT is not responding
 
 Current AUT closes USB and TUN resources on an `aut-shutdown` worker so Stop
@@ -150,7 +144,6 @@ Performance depends on:
 - phone CPU and VpnService packet handling;
 - packet size and workload;
 - Linux TUN/nftables processing;
-- optional Android loopback relay overhead.
 
 Upload and download can differ because they use different USB endpoint and
 software scheduling paths.
@@ -159,7 +152,7 @@ software scheduling paths.
 
 - complete Python output from connection through failure;
 - Android activity history and live diagnostics text;
-- selected mode and Direct/UDP/TCP/RUDP/RTCP path;
+- selected mode and Direct/RATP path;
 - server command and setup command;
 - phone model and Android version;
 - Linux distribution and kernel;

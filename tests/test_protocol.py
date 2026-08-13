@@ -3,11 +3,12 @@ import argparse
 import json
 
 from aut_protocol import (
+    ControlRecord,
     Decoder,
     Frame,
     HandshakeDecoder,
     ProtocolError,
-    RtcpDecoder,
+    RatpEngine,
     TYPE_CONFIG_RESPONSE,
     TYPE_CONFIG_REQUIRED,
     TYPE_CLIENT_READY,
@@ -17,12 +18,11 @@ from aut_protocol import (
     TYPE_PING,
     TYPE_PONG,
     TYPE_SESSION_STOP,
-    TYPE_RTCP_DATA,
-    TYPE_RUDP_PACKET,
+    TYPE_RATP_DATA,
     encode,
+    encode_control,
     encode_handshake_request,
     encode_handshake_response,
-    encode_rtcp_packet,
     negotiate_request,
 )
 from aut_server import ClientSession, LeaseManager, configure_networks, make_client_config
@@ -57,25 +57,25 @@ class ProtocolTests(unittest.TestCase):
 
     def test_cleartext_handshake_can_share_transfer_with_binary_frame(self):
         request = encode_handshake_request({
-            "Transport": "rudp", "Mode": "internet-only", "Framing": "binary-h2"
+            "Transport": "ratp", "Mode": "internet-only", "Framing": "binary-h2"
         })
-        binary = encode(Frame(TYPE_RUDP_PACKET, 8, 123, b"packet"))
+        binary = encode(Frame(TYPE_RATP_DATA, 8, 123, b"packet"))
         decoder = HandshakeDecoder()
         handshake, remainder = decoder.feed(request + binary)
         self.assertEqual(handshake[0], "HANDSHAKE AUT/4.0")
-        self.assertEqual(handshake[1]["transport"], "rudp")
-        self.assertEqual(negotiate_request(*handshake), ("4.0", "rudp"))
+        self.assertEqual(handshake[1]["transport"], "ratp")
+        self.assertEqual(negotiate_request(*handshake), ("4.0", "ratp"))
         self.assertEqual(Decoder().feed(remainder)[0].payload, b"packet")
 
     def test_handshake_response_is_cleartext(self):
         wire = encode_handshake_response("4.0", 200, "OK", {
-            "Transport": "rtcp; accepted", "Framing": "binary-h2; accepted"
+            "Transport": "ratp; accepted", "Framing": "binary-h2; accepted"
         })
         self.assertTrue(wire.startswith(b"AUT/4.0 200 OK\r\n"))
         self.assertTrue(wire.endswith(b"\r\n\r\n"))
 
     def test_every_packet_path_is_negotiated(self):
-        for transport in ("direct", "udp", "tcp", "rudp", "rtcp"):
+        for transport in ("direct", "ratp"):
             request = encode_handshake_request({
                 "Transport": transport,
                 "Mode": "internet-only",
@@ -88,18 +88,18 @@ class ProtocolTests(unittest.TestCase):
     def test_session_stop_can_be_followed_by_handshake_in_same_usb_read(self):
         stop = encode(Frame(TYPE_SESSION_STOP, 10, 55))
         request = encode_handshake_request({
-            "Transport": "rtcp",
+            "Transport": "ratp",
             "Mode": "internet-only",
             "Framing": "binary-h2",
         })
         decoder = Decoder()
         self.assertEqual(
-            decoder.feed(stop + request, max_frames=1),
+            decoder.feed(stop + request, max_records=1),
             [Frame(TYPE_SESSION_STOP, 10, 55)],
         )
         handshake, remainder = HandshakeDecoder().feed(decoder.take_pending())
         self.assertEqual(remainder, b"")
-        self.assertEqual(negotiate_request(*handshake), ("4.0", "rtcp"))
+        self.assertEqual(negotiate_request(*handshake), ("4.0", "ratp"))
 
     def test_server_renegotiates_after_stop_without_reopening_usb(self):
         class FakeGateway:
@@ -123,22 +123,66 @@ class ProtocolTests(unittest.TestCase):
         })
         stop = encode(Frame(TYPE_SESSION_STOP, 10, 55))
         second = encode_handshake_request({
-            "Transport": "rtcp", "Mode": "internet-only", "Framing": "binary-h2"
+            "Transport": "ratp", "Mode": "internet-only", "Framing": "binary-h2"
         })
         session.consume(first + stop + second)
         self.assertTrue(session.handshake_complete)
-        self.assertEqual(session.transport, "rtcp")
+        self.assertEqual(session.transport, "ratp")
         self.assertEqual(len(connection.responses), 2)
         self.assertTrue(all(response.startswith(b"AUT/4.0 200 OK")
                             for response in connection.responses))
 
-    def test_rtcp_reassembles_every_split(self):
-        packet = bytes(range(256)) * 5
-        stream = encode_rtcp_packet(packet)
-        for split in range(len(stream)):
-            decoder = RtcpDecoder()
-            self.assertEqual(decoder.feed(stream[:split]), [])
-            self.assertEqual(decoder.feed(stream[split:]), [packet])
+    def test_cleartext_ack_and_binary_frame_can_share_every_split(self):
+        ack = encode_control("ACK", (1, 2, 9))
+        frame = Frame(TYPE_RATP_DATA, 10, 123, b"packet")
+        wire = ack + encode(frame)
+        for split in range(len(wire)):
+            decoder = Decoder()
+            records = decoder.feed(wire[:split]) + decoder.feed(wire[split:])
+            self.assertEqual(records, [ControlRecord("ACK", (1, 2, 9)), frame])
+
+    def test_ack_line_carries_256_selective_sequences(self):
+        sequences = tuple(range(1, 257))
+        wire = encode_control("ACK", sequences)
+        self.assertTrue(wire.startswith(b"ACK 00000001,00000002"))
+        self.assertEqual(Decoder().feed(wire), [ControlRecord("ACK", sequences)])
+
+    def test_ratp_orders_packets_and_selectively_acks_them(self):
+        sender = RatpEngine()
+        receiver = RatpEngine()
+        first = sender.send_packet(b"one")
+        second = sender.send_packet(b"two")
+        third = sender.send_packet(b"three")
+        self.assertEqual(receiver.receive(second), [])
+        self.assertEqual(receiver.receive(first), [b"one", b"two"])
+        self.assertEqual(receiver.receive(third), [b"three"])
+        work = receiver.maintenance(force_controls=True)
+        records = []
+        for line in work.controls:
+            records.extend(Decoder().feed(line))
+        self.assertEqual(records, [ControlRecord("ACK", (1, 2, 3))])
+        for control in records:
+            self.assertEqual(sender.handle_control(control), ())
+        self.assertEqual(sender.pending_count, 0)
+
+    def test_ratp_nack_and_rto_retransmit_without_stop_and_wait(self):
+        sender = RatpEngine()
+        frames = [sender.send_packet(bytes((index,))) for index in range(1, 5)]
+        self.assertEqual(sender.pending_count, 4)
+        retransmitted = sender.handle_control(ControlRecord("NACK", (2, 4)))
+        self.assertEqual(retransmitted, (frames[1], frames[3]))
+        sender.rto_ns = 0
+        self.assertEqual(len(sender.maintenance().retransmissions), 4)
+
+    def test_ratp_splits_a_large_gap_into_256_sequence_nacks(self):
+        receiver = RatpEngine()
+        receiver.receive(Frame(TYPE_RATP_DATA, 600, 1, b"late"))
+        work = receiver.maintenance(force_controls=True)
+        nacks = [record for line in work.controls
+                 for record in Decoder().feed(line) if record.kind == "NACK"]
+        self.assertEqual([len(record.sequences) for record in nacks], [256, 256, 87])
+        self.assertEqual(nacks[0].sequences[0], 1)
+        self.assertEqual(nacks[-1].sequences[-1], 599)
 
     def test_ip_packet_round_trip(self):
         ipv4 = bytes.fromhex("4500001400000000400100000a4d000208080808")

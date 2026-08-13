@@ -24,7 +24,7 @@ internet connection.
 - Run the Python server as a normal user after Linux is prepared.
 - Test the raw USB protocol with AUTPing, without any IP dependency.
 - Test a complete checksummed ICMPv6 Echo Request/Reply.
-- Use Direct, UDP/TCP-over-`[::1]`, or USB-native RUDP/RTCP paths.
+- Choose either the lowest-overhead Direct path or reliable USB-native RATP.
 - Reconnect clients and restore sessions without restarting the server.
 
 ## How it fits together
@@ -33,7 +33,7 @@ internet connection.
 Android applications
         │ IPv4 / IPv6
 Android VpnService TUN
-        │ Direct, TCP/UDP relay, or USB-native RUDP/RTCP
+        │ Direct or USB-native RATP
 AUT Android bridge
         │ AUT/4 cleartext handshake, then compact binary frames
 Android Open Accessory USB Bulk
@@ -47,8 +47,8 @@ Wi-Fi / Ethernet / another Linux uplink
 Internet
 ```
 
-TCP and UDP use Android loopback. RUDP and RTCP terminate directly in the
-Python server and carry datagrams or stream segments inside AUT/4 USB frames.
+Both paths connect VpnService directly to the AUT USB bridge. RATP additionally
+provides AUT-level reliability around IP packets inside AUT/4 USB frames.
 The physical phone-to-computer link remains raw USB Bulk in every mode.
 
 ## Root requirements
@@ -131,7 +131,7 @@ Successful Internet mode produces server output similar to:
 ```text
 AUT/4 multiclient server ready; connect any AOA-capable Android device.
 [usb-1-39] USB accessory ready; waiting for the AUT app
-[usb-1-39] AUT/4.0 active; transport=rudp
+[usb-1-39] AUT/4.0 negotiated; transport=ratp
 [c3aa0e16] lease offered IPv4=10.77.0.229 IPv6=fd77:4155:5400:.../64
 Shared internet gateway attached to aut0
 [c3aa0e16] client ready; internet forwarding active
@@ -150,51 +150,67 @@ minimum/average/maximum RTT, and average jitter. The app keeps the latest 80
 timestamped activity events, even when its activity is closed. Diagnostics and
 activity history have separate clear buttons.
 
-## Android packet paths
+## Direct vs. RATP
 
-| Path | Description | Recommendation |
+AUT has exactly two packet paths. Both connect Android's `VpnService` directly
+to the AUT USB bridge; neither uses a local relay or a network socket between
+Android and Linux.
+
+| Property | Direct | RATP |
 | --- | --- | --- |
-| **Direct** | Moves each TUN packet directly between VpnService and AUT framing. | Best default and lowest overhead. |
-| **UDP** | Adds a protected UDP loopback hop on `[::1]`. | Useful for testing an alternate local path. |
-| **TCP** | Adds a protected, length-framed TCP loopback hop on `[::1]`. | Experimental; some Android kernels reject socket protection. |
-| **RUDP** | Preserves one IP datagram per reliable USB binary frame; no loopback socket. | USB-native datagram path. |
-| **RTCP** | Carries a length-prefixed IP stream in segmented USB binary frames; no loopback socket. | USB-native ordered stream path. |
+| Data path | One IP packet in a normal AUT binary frame. | One IP packet in a sequenced `RATP_DATA` frame. |
+| AUT send window | None. | Up to 1,024 unacknowledged packets in flight. |
+| AUT ACK/NACK | No. | Selective cleartext ACK/NACK, up to 256 sequences per line. |
+| AUT retransmission | No. | Immediate on NACK and automatic on adaptive RTO. |
+| AUT reordering | No additional reorder buffer. | Delivers packets in sequence through a 1,024-packet reorder window. |
+| Duplicate handling | Relies on USB Bulk. | Detects, acknowledges again, and does not deliver duplicates twice. |
+| Overhead | Lowest. | Higher: sequence tracking, control lines, buffering and possible retransmission. |
+| Best use | Normal operation and maximum throughput. | Testing explicit AUT-level reliability or links where endpoint recovery must be observable. |
 
-All paths use USB externally. RUDP/RTCP are AUT profiles, not actual IP
-UDP/TCP sockets; USB Bulk supplies reliable, ordered delivery.
+Direct still benefits from USB Bulk's link-level CRC, retry, and ordered
+delivery. RATP adds a separate end-to-end reliability mechanism between the
+Android and Python AUT endpoints. It is an AUT transport protocol, not an IP
+TCP or UDP socket.
 
-### What RUDP and RTCP actually mean
+### What RATP actually does
 
-The names describe how AUT frames the packets; they do **not** mean that AUT
-opens another UDP or TCP connection between Android and Linux.
+RATP adds an independent reliability layer between Android and Python:
+
+- a sliding send window with up to 1,024 packets in flight;
+- selective ACK and NACK instead of cumulative Stop-and-Wait;
+- up to 256 packet sequences in one ASCII ACK or NACK line;
+- a receive reorder buffer that delivers packets to TUN in sequence;
+- immediate retransmission requested by NACK;
+- retransmission after an adaptive RTO based on SRTT and RTT variation;
+- exponential RTO backoff and a bounded retry count;
+- duplicate detection and Karn-style exclusion of retransmitted RTT samples.
+
+ACK and NACK records are cleartext ASCII directly on the AUT USB stream:
+
+```text
+ACK 00000001,00000002,00000005\r\n
+NACK 00000003,00000004\r\n
+```
+
+They may acknowledge or request any selected packets; receiving one ACK is not
+required before sending the next data packet. This is explicitly **not
+Stop-and-Wait**.
 
 Android's `VpnService` gives AUT an original layer-3 packet. That packet already
 contains IPv4 or IPv6 and, inside it, the application's TCP, UDP, ICMP, or other
 payload. AUT wraps the original packet only in an AUT/4 USB frame:
 
 ```text
-AUT/4 USB frame
+AUT/4 RATP_DATA frame
 └── original IPv4 or IPv6 packet
     └── original TCP, UDP, ICMP, ...
         └── application data
 ```
 
-There is no second IP header, so this is not IP-in-IP. There is also no
-TCP-in-TCP or UDP-in-UDP in the RUDP/RTCP paths.
-
-| Property | RUDP profile | RTCP profile |
-| --- | --- | --- |
-| AUT representation | One complete IP datagram per `RUDP_PACKET` frame. | Length-prefixed packet stream split across `RTCP_DATA` frames. |
-| Preserves a boundary in every AUT frame | Yes. | No; the decoder reconstructs boundaries from the stream. |
-| AUT-level acknowledgements/retransmission | No. | No. |
-| AUT-level congestion control | No. | No. |
-| Delivery underneath AUT | Reliable and ordered USB Bulk. | Reliable and ordered USB Bulk. |
-
-Therefore, RUDP is a **reliable datagram-style AUT profile**, not ordinary
-unordered, best-effort UDP. RTCP is a **reliable stream-style AUT profile**,
-but it does not reimplement TCP acknowledgements, retransmission windows, or
-congestion control. USB hardware and the USB stack already perform link-level
-error detection, retry, and ordered delivery for both profiles.
+There is no second IP header: RATP is not IP-in-IP, TCP-in-TCP, or UDP-in-UDP.
+USB Bulk is already reliable underneath, but RATP deliberately provides its
+own observable end-to-end packet acknowledgement, loss recovery, and ordering
+between the AUT endpoints.
 
 ## Default addressing
 
@@ -245,8 +261,6 @@ python3 -m unittest discover -v
   active VPN while Internet or ICMPv6 mode is running.
 - IPv6 internet access requires a usable IPv6 uplink and NAT66 support on Linux.
 - AOA and USB permission behavior varies between vendors and kernels.
-- TCP loopback protection is rejected by some Android kernels; Direct and UDP
-  are more portable.
 - This repository currently builds a debug APK; it does not provide a signed
   production release.
 

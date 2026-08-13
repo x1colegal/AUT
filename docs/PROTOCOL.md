@@ -1,159 +1,145 @@
-# AUT/4 protocol reference
+# AUT/4 and RATP protocol reference
 
-AUT/4 carries control messages and layer-3 IP traffic over Android Open
-Accessory USB Bulk. It separates a readable cleartext handshake from a compact
-binary data phase. AUT does not emulate Ethernet; DHCP and SLAAC names describe
-configuration semantics, not Ethernet broadcasts.
+AUT/4 carries control messages and layer-3 IP packets over Android Open
+Accessory USB Bulk. A readable cleartext handshake selects the session before
+compact binary framing begins.
 
-## Phase 1: cleartext handshake
+## Cleartext handshake
 
-Android speaks first. Lines are ASCII with CRLF, and an empty line ends the
-handshake, like an HTTP/1.1 header block.
-
-This negotiation is mandatory for every path: Direct, UDP, TCP, RUDP, and
-RTCP. It establishes the AUT version and binary framing before any
-path-specific traffic begins.
+Negotiation is mandatory for Direct and RATP. Lines are ASCII with
+CRLF; an empty line ends the block.
 
 ```text
 HANDSHAKE AUT/4.0
 Versions: 4.0
-Transport: rudp
+Transport: ratp
 Mode: internet-only
 Framing: binary-h2
 
 
 ```
 
-The server selects a mutually supported version and reports its decisions:
-
 ```text
 AUT/4.0 200 OK
 Versions: 4.0; selected
-Transport: rudp; accepted
+Transport: ratp; accepted
 Framing: binary-h2; accepted
 Mode: internet-only; accepted
 Rejected-Options: none
-RUDP: supported
-RTCP: supported
+RATP: window=1024; sack; ack+nack; adaptive-rto; ordered
 
 
 ```
 
-A lower version may be selected only if it appears in the client's `Versions`
-list. The current implementation supports `4.0`; it never silently starts an
-incompatible older wire format. The handshake is limited to 8 KiB.
+A lower version can be selected only when the client's `Versions` option lists
+it. The current implementation supports AUT/4.0. The handshake is limited to
+8 KiB and may share a USB transfer with the first binary frame.
 
-USB reads are not message boundaries. The decoder accepts a fragmented
-handshake and preserves binary bytes arriving after the empty line in the same
-USB transfer.
+## Binary frame
 
-## Phase 2: binary frames
+The nine-byte header is inspired by HTTP/2. Integers are unsigned big endian.
 
-Every subsequent message has a nine-byte header inspired by HTTP/2. Integers
-are unsigned and big endian.
-
-| Field | Bytes | Description |
+| Field | Bytes | Meaning |
 | --- | ---: | --- |
-| Length | 3 | Bytes after the header: timestamp plus payload. |
-| Type | 1 | Message type. |
-| Flags | 1 | Type flags; `0x01` means `END_MESSAGE`. |
-| Stream ID | 4 | 31-bit sequence; the high reserved bit is zero. |
-| Monotonic timestamp | 8 | Sender clock in nanoseconds. |
-| Payload | variable | Type-specific binary data, at most 65,536 bytes. |
+| Length | 3 | Timestamp plus payload length. |
+| Type | 1 | Frame type. |
+| Flags | 1 | `0x01` means `END_MESSAGE`. |
+| Sequence | 4 | Nonzero 31-bit sequence; high bit is reserved. |
+| Timestamp | 8 | Sender monotonic clock in nanoseconds. |
+| Payload | variable | At most 65,536 bytes. |
 
-AUT/4 has no per-frame magic or CRC32. Negotiation establishes the format, and
-USB Bulk already provides link CRC, retry, ordering, and duplicate protection.
-Removing duplicated bytes lowers hot-path overhead. Frames can cross USB reads,
-and one transfer can contain many frames.
+USB Bulk already has link CRC and retry, so AUT/4 does not duplicate CRC32 in
+every binary frame. Decoders retain incomplete data across USB reads.
 
-## Frame types
+## Binary types
 
-| Type | Name | Direction | Payload |
-| ---: | --- | --- | --- |
-| 1 | `PING` | Android to Linux | Optional opaque bytes. |
-| 2 | `PONG` | Linux to Android | Mirrored PING metadata and payload. |
-| 3 | `CONFIG_REQUEST` | Android to Linux | UTF-8 JSON client identity. |
-| 4 | `CONFIG_RESPONSE` | Linux to Android | UTF-8 JSON dual-stack lease. |
-| 5 | `IP_PACKET` | Either | One IP packet for Direct/UDP/TCP. |
-| 6 | `SESSION_STOP` | Android to Linux | Empty. |
-| 7 | `CONFIG_REQUIRED` | Linux to Android | Requests lease renewal. |
-| 8 | `CLIENT_READY` | Android to Linux | Android TUN is ready. |
-| 9 | `CLIENT_READY_ACK` | Linux to Android | Dispatcher is active. |
-| 10 | `ICMP6_ECHO` | Android to Linux | Complete ICMPv6 Echo Request. |
-| 11 | `RUDP_PACKET` | Either | Exactly one complete IP datagram. |
-| 12 | `RTCP_DATA` | Either | Segment of the reliable packet stream. |
+| Type | Name | Purpose |
+| ---: | --- | --- |
+| 1/2 | `PING` / `PONG` | Protocol-level diagnostic. |
+| 3/4 | `CONFIG_REQUEST` / `CONFIG_RESPONSE` | Client identity and dual-stack lease. |
+| 5 | `IP_PACKET` | Packet for the Direct path. |
+| 6 | `SESSION_STOP` | Return the USB connection to handshake phase. |
+| 7 | `CONFIG_REQUIRED` | Request lease renewal. |
+| 8/9 | `CLIENT_READY` / `CLIENT_READY_ACK` | Activate dispatcher registration. |
+| 10 | `ICMP6_ECHO` | Dedicated ICMPv6 diagnostic request. |
+| 11 | `RATP_DATA` | One IP packet managed by RATP reliability. |
 
-## Packet-path negotiation
+## RATP
 
-| Transport | Android local path | USB representation |
-| --- | --- | --- |
-| `direct` | TUN directly to bridge | `IP_PACKET` per packet. |
-| `udp` | Protected UDP sockets on `[::1]` | `IP_PACKET` after relay. |
-| `tcp` | Protected TCP connection on `[::1]` | `IP_PACKET` after relay. |
-| `rudp` | TUN directly to bridge | `RUDP_PACKET` per datagram. |
-| `rtcp` | TUN directly to bridge | `RTCP_DATA` stream segments. |
+RATP means **Reliable AUT Transport Protocol**. It does not create a TCP or UDP
+socket and does not add another IP header. `RATP_DATA` contains the original IP
+packet obtained from TUN.
 
-RUDP and RTCP are AUT profiles, not IP sockets. They terminate in the Python
-server inside USB frames and use USB Bulk reliability and ordering. They avoid
-a redundant acknowledgement layer that would reduce throughput.
+### Sliding window
 
-### RUDP
+Each direction has an independent 31-bit packet sequence space and allows up
+to 1,024 unacknowledged packets in flight. Sending continues while earlier
+packets await acknowledgement; RATP is not Stop-and-Wait.
 
-Each `RUDP_PACKET` contains one whole IPv4 or IPv6 packet and sets
-`END_MESSAGE`. Datagram boundaries are preserved.
+### Cleartext SACK and NACK
 
-### RTCP
-
-Each IP packet enters an ordered byte stream as a two-byte big-endian length
-followed by packet bytes. The stream is split into `RTCP_DATA` frames up to
-16 KiB. A persistent decoder rebuilds packets across AUT-frame and USB-read
-boundaries.
-
-## Configuration
-
-The binary `CONFIG_REQUEST` follows a successful handshake:
-
-```json
-{
-  "protocol": 4,
-  "relay": "rtcp",
-  "client_id": "c3aa0e16-0000-4000-8000-000000000000",
-  "host_id": "60a3f97cc7895fea"
-}
-```
-
-`relay` remains for diagnostics; the handshake is authoritative. The response
-contains `mtu`, DHCPv4-equivalent address/prefix, DHCPv6-equivalent address,
-gateway, delegated SLAAC `/64`, inherited DNS, and routes.
+RATP control records are raw ASCII lines interleaved with binary frames:
 
 ```text
-Android                              Linux
-   | HANDSHAKE AUT/4.0 + options       |
-   |----------------------------------->|
-   | AUT/4.0 200 OK + decisions         |
-   |<-----------------------------------|
-   | CONFIG_REQUEST                     |
-   |----------------------------------->| allocate or restore lease
-   | CONFIG_RESPONSE                    |
-   |<-----------------------------------|
-   | establish VpnService TUN           |
-   | CLIENT_READY                       |
-   |----------------------------------->| register destination addresses
-   | CLIENT_READY_ACK                   |
-   |<-----------------------------------|
-   | negotiated binary packet frames    |
-   |<==================================>|
+ACK 00000001,00000002,00000005
+NACK 00000003,00000004
 ```
 
-Android repeats `CLIENT_READY` until acknowledged. Linux queues up to 128 early
-packets. `CONFIG_REQUIRED` repairs a live VPN after a server restart.
+Every value is an eight-digit hexadecimal packet sequence. One line can carry
+1 through 256 selected sequences. `ACK` selectively removes those packets from
+the sender window. `NACK` requests immediate retransmission of those packets.
+Lines are emitted after a short delayed-ACK interval or immediately when a
+256-sequence batch fills.
 
-## Errors and limits
+### Ordering and loss detection
 
-- Invalid handshake syntax, version, transport, framing, reserved stream bit,
-  or frame length is a protocol error.
-- Frame payload is limited to 65,536 bytes; an RTCP IP packet to 65,535.
-- Invalid IP shapes are rejected before entering the Linux TUN.
-- USB timeout is an idle poll, not a disconnect.
-- `SESSION_STOP` removes routing, resets binary decoding, and returns the
-  reusable accessory connection to the cleartext handshake phase.
+The receiver delivers the next expected packet immediately. Later packets are
+kept in a 1,024-entry reorder window. A detected sequence gap queues NACKs for
+missing packets. When the missing packet arrives, it and every now-contiguous
+buffered packet are delivered to TUN in order. Duplicates are ACKed again but
+never delivered twice.
+
+### RTO
+
+Every outstanding packet stores its send time. ACK samples update smoothed RTT
+and RTT variation; `RTO = SRTT + 4 * RTTVAR`, clamped from 50 ms to 2 seconds.
+Retransmitted packets do not contribute RTT samples (Karn's rule). An RTO
+retransmits every expired packet, doubles the current RTO up to the maximum,
+and aborts a sequence after 12 retries.
+
+### Mixed stream decoding
+
+Binary frames and ASCII ACK/NACK lines can be fragmented, combined, or
+interleaved in USB reads. The mixed decoder distinguishes an ACK/NACK record by
+its leading ASCII `A`/`N`; valid binary length bytes cannot begin with those
+values because AUT's maximum frame length is much smaller.
+
+## Session lifecycle
+
+```text
+Android                         Linux
+   | cleartext handshake          |
+   |----------------------------->|
+   | negotiated response          |
+   |<-----------------------------|
+   | CONFIG_REQUEST/RESPONSE      |
+   |<---------------------------->|
+   | CLIENT_READY/ACK             |
+   |<---------------------------->|
+   | binary data + ASCII ACK/NACK |
+   |<============================>|
+```
+
+`SESSION_STOP` clears RATP windows and reorder state, unregisters routes, and
+returns the still-open USB accessory to the cleartext handshake phase. A new
+handshake can follow Stop in the same USB read.
+
+## Limits and errors
+
+- Frame payload: 65,536 bytes.
+- RATP window: 1,024 packets per direction.
+- ACK/NACK batch: 256 sequences per ASCII line.
+- RATP retries: 12 per sequence.
+- Invalid syntax, sequence, length, window position, or retry exhaustion is a
+  protocol error.
+- USB timeout remains an idle poll, not a disconnect.

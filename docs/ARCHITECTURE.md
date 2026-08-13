@@ -22,7 +22,7 @@ AUT/
 │       │   ├── AutEventLog.java
 │       │   ├── AutProtocol.java
 │       │   ├── AutVpnService.java
-│       │   ├── LoopbackRelay.java
+│       │   ├── RatpTransport.java
 │       │   ├── MainActivity.java
 │       │   └── PingStats.java
 │       └── res/             Material 3 UI, icons, strings, USB filter
@@ -68,13 +68,13 @@ idle.
 ### `MainActivity`
 
 Material 3 control surface. It discovers the AOA accessory, requests USB/VPN
-permission, starts modes, selects Direct/UDP/TCP/RUDP/RTCP, renders persisted logs and
+permission, starts modes, selects Direct/RATP, renders persisted logs and
 diagnostics, and exposes independent clear actions.
 
 ### `AutVpnService`
 
 The foreground service owns the accessory file descriptor, VpnService TUN,
-protocol reader, packet pumps, ping schedules, relay, session generation, and
+protocol reader, packet pumps, ping schedules, RATP, session generation, and
 shutdown. A generation integer prevents threads from an old mode from touching
 a newer session after a fast mode switch.
 
@@ -85,19 +85,17 @@ Important worker threads:
 | `aut-usb-reader` | Negotiate cleartext AUT/4, then decode binary frames. |
 | `aut-tun-reader` | Read Android TUN packets and send them toward USB. |
 | scheduler | AUTPing, ICMPv6 Ping, readiness retries, and lease timeout. |
-| `aut-shutdown` | Potentially blocking USB/TUN/relay cleanup. |
-| relay threads | Optional UDP or TCP loopback packet movement. |
+| `aut-shutdown` | Potentially blocking USB/TUN cleanup. |
 
 ### `AutProtocol`
 
 Java counterpart to `aut_protocol.py`. Both implement the cleartext handshake,
-nine-byte binary header, and RTCP reassembly and must be updated together.
+nine-byte binary header and mixed ASCII RATP controls and must be updated together.
 
-### `LoopbackRelay`
+### `RatpTransport`
 
-Implements the optional `[::1]` UDP and TCP paths. It is deliberately separate
-from USB framing; the relay only changes how packets travel locally between the
-VpnService pump and AUT bridge.
+Implements RATP's sliding send window, selective ACK/NACK handling, reorder
+buffer, adaptive RTO, and retransmission state on Android.
 
 ### `PingStats` and `AutEventLog`
 

@@ -126,7 +126,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
             app:checkedButton="@id/path_direct"
-            app:selectionRequired="false"
+            app:selectionRequired="true"
             app:singleSelection="true">
 
             <com.google.android.material.button.MaterialButton
@@ -134,31 +134,9 @@
                 android:layout_width="0dp" android:layout_height="wrap_content"
                 android:layout_weight="1" android:text="@string/direct" />
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/path_udp" style="@style/Widget.Material3.Button.OutlinedButton"
+                android:id="@+id/path_ratp" style="@style/Widget.Material3.Button.OutlinedButton"
                 android:layout_width="0dp" android:layout_height="wrap_content"
-                android:layout_weight="1" android:text="@string/udp" />
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/path_tcp" style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="0dp" android:layout_height="wrap_content"
-                android:layout_weight="1" android:text="@string/tcp" />
-        </com.google.android.material.button.MaterialButtonToggleGroup>
-
-        <com.google.android.material.button.MaterialButtonToggleGroup
-            android:id="@+id/reliable_path_toggle"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            app:selectionRequired="false"
-            app:singleSelection="true">
-
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/path_rudp" style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="0dp" android:layout_height="wrap_content"
-                android:layout_weight="1" android:text="@string/rudp" />
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/path_rtcp" style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="0dp" android:layout_height="wrap_content"
-                android:layout_weight="1" android:text="@string/rtcp" />
+                android:layout_weight="1" android:text="@string/ratp" />
         </com.google.android.material.button.MaterialButtonToggleGroup>
 
         <TextView

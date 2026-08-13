@@ -70,7 +70,7 @@ public final class AutVpnService extends VpnService {
     private boolean internetEnabled;
     private boolean routeInternetEnabled;
     private boolean icmp6Enabled;
-    private String relayProtocol = "direct";
+    private String transportProtocol = "direct";
     private ParcelFileDescriptor accessoryFd;
     private ParcelFileDescriptor tunFd;
     private FileInputStream usbInput;
@@ -78,12 +78,11 @@ public final class AutVpnService extends VpnService {
     private FileInputStream tunInput;
     private FileOutputStream tunOutput;
     private ScheduledExecutorService scheduler;
-    private LoopbackRelay relay;
     private long packetsUp;
     private long packetsDown;
     private volatile boolean clientReadyAcknowledged;
     private volatile boolean handshakeComplete;
-    private AutProtocol.RtcpDecoder rtcpDecoder = new AutProtocol.RtcpDecoder();
+    private RatpTransport ratp = new RatpTransport();
     private byte[] clientIpv6;
     private byte[] gatewayIpv6;
     private final AtomicInteger icmp6Sequence = new AtomicInteger(1);
@@ -110,12 +109,11 @@ public final class AutVpnService extends VpnService {
                 : intent.getStringExtra(EXTRA_MODE);
         if (!MODE_PING.equals(mode) && !MODE_ICMP6.equals(mode)
                 && !MODE_INTERNET.equals(mode)) mode = MODE_INTERNET;
-        relayProtocol = intent == null
+        transportProtocol = intent == null
                 ? getPreferences().getString(PREF_TRANSPORT, "direct")
                 : intent.getStringExtra(EXTRA_TRANSPORT);
-        if (!"tcp".equals(relayProtocol) && !"udp".equals(relayProtocol)
-                && !"rudp".equals(relayProtocol) && !"rtcp".equals(relayProtocol)) {
-            relayProtocol = "direct";
+        if (!"ratp".equals(transportProtocol)) {
+            transportProtocol = "direct";
         }
         pingEnabled = MODE_PING.equals(mode);
         routeInternetEnabled = MODE_INTERNET.equals(mode);
@@ -123,7 +121,7 @@ public final class AutVpnService extends VpnService {
         internetEnabled = icmp6Enabled || routeInternetEnabled;
         getPreferences().edit()
                 .putString(PREF_MODE, mode)
-                .putString(PREF_TRANSPORT, relayProtocol)
+                .putString(PREF_TRANSPORT, transportProtocol)
                 .apply();
         if (routeInternetEnabled) {
             publishDiagnosticState(
@@ -163,16 +161,16 @@ public final class AutVpnService extends VpnService {
         running = true;
         clientReadyAcknowledged = false;
         handshakeComplete = false;
-        rtcpDecoder = new AutProtocol.RtcpDecoder();
+        ratp = new RatpTransport();
         usbInput = new FileInputStream(accessoryFd.getFileDescriptor());
         usbOutput = new FileOutputStream(accessoryFd.getFileDescriptor());
         scheduler = Executors.newSingleThreadScheduledExecutor();
         new Thread(() -> usbLoop(generation), "aut-usb-reader").start();
-        sendRaw(AutProtocol.handshakeRequest(relayProtocol,
+        sendRaw(AutProtocol.handshakeRequest(transportProtocol,
                 pingEnabled ? MODE_PING : icmp6Enabled ? MODE_ICMP6 : MODE_INTERNET), generation);
         if (!isCurrent(generation)) return;
         status("Negotiating AUT/" + AutProtocol.VERSION + " · "
-                + relayProtocol.toUpperCase(Locale.US));
+                + transportProtocol.toUpperCase(Locale.US));
         scheduler.schedule(() -> {
             if (isCurrent(generation) && !handshakeComplete) {
                 fail("AUT handshake timeout", generation);
@@ -181,6 +179,10 @@ public final class AutVpnService extends VpnService {
     }
 
     private void onHandshakeComplete(int generation) throws Exception {
+        if ("ratp".equals(transportProtocol)) {
+            scheduler.scheduleWithFixedDelay(
+                    () -> ratpMaintenance(generation), 5, 5, TimeUnit.MILLISECONDS);
+        }
         if (pingEnabled) {
             scheduler.scheduleWithFixedDelay(
                     () -> sendPing(generation), 0, 1, TimeUnit.SECONDS);
@@ -214,7 +216,7 @@ public final class AutVpnService extends VpnService {
         try {
             return new JSONObject()
                     .put("protocol", 4)
-                    .put("relay", relayProtocol)
+                    .put("transport", transportProtocol)
                     .put("client_id", clientId)
                     .put("host_id", hostId)
                     .toString()
@@ -225,7 +227,7 @@ public final class AutVpnService extends VpnService {
     }
 
     private void usbLoop(int generation) {
-        AutProtocol.Decoder decoder = new AutProtocol.Decoder();
+        AutProtocol.WireDecoder decoder = new AutProtocol.WireDecoder();
         AutProtocol.HandshakeDecoder handshakeDecoder = new AutProtocol.HandshakeDecoder();
         byte[] buffer = new byte[64 * 1024];
         try {
@@ -241,13 +243,15 @@ public final class AutVpnService extends VpnService {
                     validateHandshake(handshake);
                     handshakeComplete = true;
                     status("AUT/" + AutProtocol.VERSION + " negotiated · "
-                            + relayProtocol.toUpperCase(Locale.US));
+                            + transportProtocol.toUpperCase(Locale.US));
                     onHandshakeComplete(generation);
                     binary = handshake.remainder;
                     binaryCount = binary.length;
                 }
-                for (AutProtocol.Frame frame : decoder.feed(binary, binaryCount)) {
-                    onFrame(frame, generation);
+                for (Object record : decoder.feed(binary, binaryCount)) {
+                    if (record instanceof AutProtocol.ControlRecord) {
+                        onRatpControl((AutProtocol.ControlRecord) record, generation);
+                    } else onFrame((AutProtocol.Frame) record, generation);
                 }
             }
         } catch (Exception error) {
@@ -257,13 +261,36 @@ public final class AutVpnService extends VpnService {
         }
     }
 
+    private void onRatpControl(AutProtocol.ControlRecord control, int generation)
+            throws Exception {
+        if (!"ratp".equals(transportProtocol)) {
+            throw new AutProtocol.ProtocolException("RATP ACK/NACK was not negotiated");
+        }
+        for (AutProtocol.Frame frame : ratp.handleControl(control)) {
+            sendEncoded(AutProtocol.encode(frame), generation);
+        }
+    }
+
+    private void ratpMaintenance(int generation) {
+        if (!isCurrent(generation) || !"ratp".equals(transportProtocol)) return;
+        try {
+            RatpTransport.Work work = ratp.maintenance();
+            for (byte[] control : work.controls) sendRaw(control, generation);
+            for (AutProtocol.Frame frame : work.retransmissions) {
+                sendEncoded(AutProtocol.encode(frame), generation);
+            }
+        } catch (Exception error) {
+            fail("RATP error: " + usefulMessage(error), generation);
+        }
+    }
+
     private void validateHandshake(AutProtocol.Handshake handshake) throws Exception {
         if (!handshake.firstLine.startsWith("AUT/" + AutProtocol.VERSION + " 200 ")) {
             throw new AutProtocol.ProtocolException(
                     "server rejected handshake: " + handshake.firstLine);
         }
         String transport = handshake.options.get("transport");
-        if (transport == null || !transport.split(";", 2)[0].trim().equals(relayProtocol)) {
+        if (transport == null || !transport.split(";", 2)[0].trim().equals(transportProtocol)) {
             throw new AutProtocol.ProtocolException("server selected a different transport");
         }
         String framing = handshake.options.get("framing");
@@ -301,20 +328,15 @@ public final class AutVpnService extends VpnService {
                             + " · IPv4 + IPv6"
                     : "ICMPv6 diagnostic link active");
         } else if ((frame.type == AutProtocol.IP_PACKET
-                || frame.type == AutProtocol.RUDP_PACKET
-                || frame.type == AutProtocol.RTCP_DATA) && internetEnabled) {
-            if (frame.type == AutProtocol.RUDP_PACKET && !"rudp".equals(relayProtocol)) {
-                throw new AutProtocol.ProtocolException("unexpected RUDP frame");
+                || frame.type == AutProtocol.RATP_DATA) && internetEnabled) {
+            if (frame.type == AutProtocol.RATP_DATA && !"ratp".equals(transportProtocol)) {
+                throw new AutProtocol.ProtocolException("unexpected RATP_DATA frame");
             }
-            if (frame.type == AutProtocol.RTCP_DATA && !"rtcp".equals(relayProtocol)) {
-                throw new AutProtocol.ProtocolException("unexpected RTCP frame");
+            if (frame.type == AutProtocol.IP_PACKET && "ratp".equals(transportProtocol)) {
+                throw new AutProtocol.ProtocolException("unexpected plain IP frame in RATP");
             }
-            if (frame.type == AutProtocol.IP_PACKET
-                    && ("rudp".equals(relayProtocol) || "rtcp".equals(relayProtocol))) {
-                throw new AutProtocol.ProtocolException("unexpected plain IP frame");
-            }
-            java.util.List<byte[]> packets = frame.type == AutProtocol.RTCP_DATA
-                    ? rtcpDecoder.feed(frame.payload)
+            java.util.List<byte[]> packets = frame.type == AutProtocol.RATP_DATA
+                    ? ratp.receive(frame)
                     : java.util.Collections.singletonList(frame.payload);
             for (byte[] packet : packets) receiveIpPacket(packet, generation);
         }
@@ -322,24 +344,13 @@ public final class AutVpnService extends VpnService {
 
     private void receiveIpPacket(byte[] packet, int generation) throws IOException {
         if (receiveIcmp6Reply(packet)) return;
-        LoopbackRelay current = relay;
-        if (current == null) writeIpToTun(packet, generation);
-        else current.sendFromUsb(packet);
+        writeIpToTun(packet, generation);
     }
 
     private synchronized void configureVpn(JSONObject config, int generation) throws Exception {
         if (!isCurrent(generation) || tunFd != null) return;
-        if ("tcp".equals(relayProtocol) || "udp".equals(relayProtocol)) {
-            status("Preparing " + relayProtocol.toUpperCase() + " relay on [::1]");
-            relay = new LoopbackRelay(
-                    this, relayProtocol,
-                    packet -> sendIpToUsb(packet, generation),
-                    packet -> writeIpToTun(packet, generation));
-            relay.start();
-        } else if ("rudp".equals(relayProtocol)) {
-            status("Preparing reliable USB datagram path (RUDP)");
-        } else if ("rtcp".equals(relayProtocol)) {
-            status("Preparing reliable USB stream path (RTCP)");
+        if ("ratp".equals(transportProtocol)) {
+            status("Preparing Reliable AUT Transport Protocol");
         } else status("Preparing direct TUN-to-USB packet path");
         Builder builder = new Builder()
                 .setSession("AUT USB")
@@ -369,13 +380,9 @@ public final class AutVpnService extends VpnService {
         try {
             tunFd = builder.establish();
         } catch (Exception error) {
-            if (relay != null) relay.close();
-            relay = null;
             throw new IOException("TUN setup failed: " + usefulMessage(error), error);
         }
         if (tunFd == null) {
-            if (relay != null) relay.close();
-            relay = null;
             throw new IOException("VpnService.establish() returned null");
         }
         tunInput = new FileInputStream(tunFd.getFileDescriptor());
@@ -391,10 +398,10 @@ public final class AutVpnService extends VpnService {
     }
 
     private String packetPathDescription() {
-        if ("rudp".equals(relayProtocol) || "rtcp".equals(relayProtocol)) {
-            return relayProtocol.toUpperCase(Locale.US) + " over USB frames";
+        if ("ratp".equals(transportProtocol)) {
+            return "RATP reliable window over USB";
         }
-        return relay == null ? "Direct USB" : relay.description();
+        return "Direct USB";
     }
 
     private void sendClientReady(int generation) {
@@ -411,9 +418,7 @@ public final class AutVpnService extends VpnService {
                 if (!isCurrent(generation)) break;
                 byte[] copy = new byte[count];
                 System.arraycopy(packet, 0, copy, 0, count);
-                LoopbackRelay current = relay;
-                if (current == null) sendIpToUsb(copy, generation);
-                else current.sendFromVpn(copy);
+                sendIpToUsb(copy, generation);
             }
         } catch (IOException error) {
             if (isCurrent(generation)) {
@@ -424,15 +429,12 @@ public final class AutVpnService extends VpnService {
 
     private void sendIpToUsb(byte[] packet, int generation) {
         if (!isCurrent(generation)) return;
-        if ("rudp".equals(relayProtocol)) {
-            sendFrame(AutProtocol.RUDP_PACKET, AutProtocol.END_MESSAGE, packet, generation);
-        } else if ("rtcp".equals(relayProtocol)) {
-            byte[] stream = AutProtocol.rtcpPacket(packet);
-            for (int offset = 0; offset < stream.length; offset += 16 * 1024) {
-                int end = Math.min(offset + 16 * 1024, stream.length);
-                byte flags = end == stream.length ? AutProtocol.END_MESSAGE : 0;
-                sendFrame(AutProtocol.RTCP_DATA, flags,
-                        java.util.Arrays.copyOfRange(stream, offset, end), generation);
+        if ("ratp".equals(transportProtocol)) {
+            try {
+                sendEncoded(AutProtocol.encode(ratp.sendPacket(packet)), generation);
+            } catch (IOException error) {
+                fail("RATP send error: " + usefulMessage(error), generation);
+                return;
             }
         } else sendFrame(AutProtocol.IP_PACKET, AutProtocol.END_MESSAGE, packet, generation);
         packetsUp++;
@@ -651,8 +653,6 @@ public final class AutVpnService extends VpnService {
         sessionGeneration.incrementAndGet();
         if (scheduler != null) scheduler.shutdownNow();
         scheduler = null;
-        if (relay != null) relay.close();
-        relay = null;
         close(tunInput); close(tunOutput); close(tunFd);
         close(usbInput); close(usbOutput); close(accessoryFd);
         tunInput = null; tunOutput = null; tunFd = null;

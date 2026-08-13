@@ -86,32 +86,13 @@ The TUN reader sends packets directly into AUT frames. Incoming AUT IP packets
 are written directly to the TUN. This is the recommended path and has the least
 overhead.
 
-### UDP
+### RATP
 
-AUT creates two protected UDP sockets connected over IPv6 loopback `[::1]`.
-Packets cross that local relay before entering AUT framing or the TUN. USB is
-still the external transport.
-
-### TCP
-
-AUT creates a protected TCP connection on `[::1]`. Each packet receives a
-two-byte length prefix. Some Android kernels reject `VpnService.protect()` for
-local TCP sockets; use Direct or UDP when the app reports a protection error.
-
-### RUDP
-
-The TUN connects directly to the AUT bridge with no loopback socket. Every IP
-datagram becomes a dedicated `RUDP_PACKET` binary frame and keeps its boundary.
-Reliability comes from USB Bulk delivery.
-
-### RTCP
-
-The TUN also connects directly to the AUT bridge. IP packets receive a two-byte
-length prefix, enter an ordered stream, and are segmented into `RTCP_DATA`
-frames. Python rebuilds packets even across frame and USB-read boundaries.
-
-RUDP and RTCP do not call `VpnService.protect()` because they create no IP
-socket. They are direct Android-to-PC AUT/4 transports inside USB frames.
+The TUN connects directly to the AUT bridge without a loopback socket. RATP
+wraps each IP packet in `RATP_DATA`, keeps multiple packets in a sliding window,
+processes cleartext selective ACK/NACK records, retransmits on NACK or adaptive
+RTO, and reorders received packets before writing them to TUN. It does not call
+`VpnService.protect()` because it creates no IP socket.
 
 ## Session lifecycle
 
