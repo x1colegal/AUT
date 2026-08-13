@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="Theme.Material3.DynamicColors.DayNight.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="colorPrimary">@color/aut_primary</item>
+        <item name="colorOnPrimary">@color/aut_on_primary</item>
+        <item name="colorSecondary">@color/aut_secondary</item>
+        <item name="colorTertiary">@color/aut_tertiary</item>
+        <item name="colorSurface">@color/aut_surface</item>
+        <item name="colorSurfaceContainer">@color/aut_surface_container</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">?attr/colorSurface</item>
+        <item name="android:statusBarColor">?attr/colorSurface</item>
+    </style>
+
+    <style name="Widget.AUT.ModeCard" parent="Widget.Material3.CardView.Elevated">
+        <item name="cardCornerRadius">28dp</item>
+        <item name="cardElevation">1dp</item>
+        <item name="strokeWidth">0dp</item>
+    </style>
+</resources>

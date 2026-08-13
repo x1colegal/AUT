@@ -1,0 +1,7 @@
+.gradle/
+.venv/
+build/
+app/build/
+local.properties
+__pycache__/
+*.pyc

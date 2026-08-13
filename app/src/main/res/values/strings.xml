@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AUT</string>
+    <string name="headline">USB networking, your way</string>
+    <string name="subtitle">A raw USB link for IPv4, IPv6 and live diagnostics</string>
+    <string name="connection">Connection</string>
+    <string name="waiting_usb">Waiting for AUT over USB</string>
+    <string name="path_title">Packet path</string>
+    <string name="path_description">Choose how packets travel between VpnService and USB</string>
+    <string name="direct">Direct</string>
+    <string name="udp">UDP</string>
+    <string name="tcp">TCP</string>
+    <string name="direct_support">Lowest overhead</string>
+    <string name="loopback_support">TCP and UDP use protected [::1] sockets</string>
+    <string name="choose_mode">Choose a mode</string>
+    <string name="ping_title">AUTPing only</string>
+    <string name="ping_subtitle">Measure protocol and USB quality without IP or VPN</string>
+    <string name="icmp6_only_title">ICMPv6 Ping only</string>
+    <string name="icmp6_only_subtitle">Test IPv6 to the Linux AUT gateway without routing Internet</string>
+    <string name="internet_title">Internet only</string>
+    <string name="internet_subtitle">Route IPv4 and IPv6 through the Linux gateway</string>
+    <string name="stop">Stop AUT</string>
+    <string name="activity">Activity</string>
+    <string name="no_events">No events yet</string>
+    <string name="ipv4">IPv4</string>
+    <string name="ipv6">IPv6</string>
+    <string name="usb_bulk">USB Bulk</string>
+    <string name="diagnostics">Live diagnostics</string>
+    <string name="aut_ping_waiting">AUTPing · waiting</string>
+    <string name="icmp6_ping_waiting">ICMPv6 Ping · waiting for an IP lease</string>
+    <string name="clear_history">Clear history</string>
+    <string name="clear_diagnostics">Clear diagnostics</string>
+</resources>

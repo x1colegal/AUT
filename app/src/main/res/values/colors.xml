@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="aut_primary">#A8F2D2</color>
+    <color name="aut_on_primary">#003828</color>
+    <color name="aut_secondary">#B7CCBF</color>
+    <color name="aut_tertiary">#A9C8E8</color>
+    <color name="aut_surface">#101412</color>
+    <color name="aut_surface_container">#1C211E</color>
+</resources>

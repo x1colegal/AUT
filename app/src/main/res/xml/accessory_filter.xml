@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <usb-accessory
+        manufacturer="AUT Project"
+        model="Advanced USB Tethering"
+        version="1" />
+</resources>
