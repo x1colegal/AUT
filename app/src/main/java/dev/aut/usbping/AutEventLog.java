@@ -43,6 +43,9 @@ final class AutEventLog {
     }
 
     static synchronized void clear(Context context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply();
+        // Activity history can be cleared without erasing the current service
+        // state shown in the connection card.
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().remove(HISTORY).apply();
     }
 }

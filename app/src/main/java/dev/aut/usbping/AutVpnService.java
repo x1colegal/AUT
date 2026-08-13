@@ -50,9 +50,11 @@ public final class AutVpnService extends VpnService {
 
     private static final String CHANNEL = "aut_vpn";
     private static final int NOTIFICATION_ID = 77;
-    private static final String PREFS = "aut_service";
+    static final String PREFS = "aut_service";
     private static final String PREF_MODE = "mode";
     private static final String PREF_TRANSPORT = "transport";
+    private static final String PREF_ACTIVE = "active";
+    private static final String PREF_RUNTIME_STATUS = "runtime_status";
     private static final String PREF_CLIENT_ID = "client_id";
     private static final String PREF_HOST_ID = "host_id";
     static final String PREF_AUT_PING = "aut_ping_status";
@@ -107,6 +109,7 @@ public final class AutVpnService extends VpnService {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             desiredActive = false;
             cancelReconnect();
+            getPreferences().edit().putBoolean(PREF_ACTIVE, false).apply();
             status("AUT stopped");
             shutdownAsync(true);
             return START_NOT_STICKY;
@@ -133,6 +136,7 @@ public final class AutVpnService extends VpnService {
         getPreferences().edit()
                 .putString(PREF_MODE, mode)
                 .putString(PREF_TRANSPORT, transportProtocol)
+                .putBoolean(PREF_ACTIVE, true)
                 .apply();
         if (routeInternetEnabled) {
             publishDiagnosticState(
@@ -156,6 +160,21 @@ public final class AutVpnService extends VpnService {
 
     private android.content.SharedPreferences getPreferences() {
         return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    static boolean isActive(android.content.Context context) {
+        return context.getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_ACTIVE, false);
+    }
+
+    static String runtimeStatus(android.content.Context context) {
+        return context.getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(PREF_RUNTIME_STATUS, "AUT is running");
+    }
+
+    static String selectedTransport(android.content.Context context) {
+        return context.getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(PREF_TRANSPORT, "direct");
     }
 
     private void startTransport(int generation) {
@@ -625,6 +644,7 @@ public final class AutVpnService extends VpnService {
     }
 
     private void status(String message) {
+        getPreferences().edit().putString(PREF_RUNTIME_STATUS, message).apply();
         AutEventLog.append(this, message);
         ((NotificationManager) getSystemService(NOTIFICATION_SERVICE))
                 .notify(NOTIFICATION_ID, notification(message));
@@ -636,6 +656,7 @@ public final class AutVpnService extends VpnService {
         if (!isCurrent(generation)) return;
         desiredActive = false;
         cancelReconnect();
+        getPreferences().edit().putBoolean(PREF_ACTIVE, false).apply();
         status(message);
         shutdown(false);
         stopSelf();
@@ -771,6 +792,7 @@ public final class AutVpnService extends VpnService {
     @Override public void onRevoke() {
         desiredActive = false;
         cancelReconnect();
+        getPreferences().edit().putBoolean(PREF_ACTIVE, false).apply();
         status("VPN permission revoked");
         shutdownAsync(true);
     }

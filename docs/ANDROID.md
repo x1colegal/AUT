@@ -112,6 +112,13 @@ without another user tap. Failed attempts retry immediately with no backoff.
 Only an explicit **Stop AUT**, a mode change, or revoked VPN permission cancels
 the current recovery cycle.
 
+AOA re-enumeration is received by a no-display attachment dispatcher. When AUT
+is already active, reconnecting USB does not launch or bring the control screen
+to the foreground. Opening the app manually restores the persisted running
+status and Direct/RATP selection instead of presenting an idle “choose a mode”
+state. Clearing activity history removes only old entries and preserves the
+current connection status.
+
 The latest 80 activity entries are persisted in app preferences. Closing and
 reopening the activity does not erase them. **Clear history** removes activity
 entries; **Clear diagnostics** resets ping counters independently.

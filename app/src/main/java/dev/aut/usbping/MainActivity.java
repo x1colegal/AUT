@@ -86,7 +86,7 @@ public final class MainActivity extends Activity {
         });
         findViewById(R.id.clear_history).setOnClickListener(view -> {
             AutEventLog.clear(this);
-            renderEventLog();
+            renderOperationalState();
         });
     }
 
@@ -132,10 +132,18 @@ public final class MainActivity extends Activity {
             if (list != null && list.length > 0) accessory = list[0];
         }
         if (accessory == null) {
+            if (AutVpnService.isActive(this)) {
+                renderOperationalState();
+                return;
+            }
             showStatus("Waiting for the AUT USB accessory");
             return;
         }
         if (usbManager.hasPermission(accessory)) {
+            if (AutVpnService.isActive(this)) {
+                renderOperationalState();
+                return;
+            }
             showStatus("USB ready — choose a mode");
             linkIndicator.setVisibility(View.INVISIBLE);
             return;
@@ -201,8 +209,23 @@ public final class MainActivity extends Activity {
     }
 
     private void restoreEventLog() {
-        renderEventLog();
+        renderOperationalState();
         renderPingStats(null, null);
+    }
+
+    private void renderOperationalState() {
+        boolean active = AutVpnService.isActive(this);
+        if (active) {
+            statusView.setText(AutVpnService.runtimeStatus(this));
+            linkIndicator.setVisibility(View.VISIBLE);
+            int button = "ratp".equals(AutVpnService.selectedTransport(this))
+                    ? R.id.path_ratp : R.id.path_direct;
+            if (pathToggle.getCheckedButtonId() != button) pathToggle.check(button);
+        } else {
+            statusView.setText(AutEventLog.latest(this));
+            linkIndicator.setVisibility(View.INVISIBLE);
+        }
+        eventLog.setText(AutEventLog.history(this));
     }
 
     private void renderEventLog() {
@@ -222,7 +245,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
-        renderEventLog();
+        renderOperationalState();
     }
 
     @Override protected void onDestroy() {

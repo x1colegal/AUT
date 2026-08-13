@@ -18,4 +18,6 @@
         <item name="cardElevation">1dp</item>
         <item name="strokeWidth">0dp</item>
     </style>
+
+    <style name="AccessoryDispatchTheme" parent="android:style/Theme.NoDisplay" />
 </resources>
