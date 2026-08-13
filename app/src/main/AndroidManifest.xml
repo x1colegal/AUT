@@ -9,9 +9,9 @@
     <application
         android:name=".AutApplication"
         android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/ic_launcher_v2"
         android:label="AUT Control Deck"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/ic_launcher_round_v2"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
