@@ -159,7 +159,7 @@ software scheduling paths.
 
 - complete Python output from connection through failure;
 - Android activity history and live diagnostics text;
-- selected mode and Direct/UDP/TCP path;
+- selected mode and Direct/UDP/TCP/RUDP/RTCP path;
 - server command and setup command;
 - phone model and Android version;
 - Linux distribution and kernel;

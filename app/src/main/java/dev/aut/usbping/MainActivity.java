@@ -32,6 +32,8 @@ public final class MainActivity extends Activity {
     private TextView icmp6PingView;
     private CircularProgressIndicator linkIndicator;
     private MaterialButtonToggleGroup pathToggle;
+    private MaterialButtonToggleGroup reliablePathToggle;
+    private boolean changingPathSelection;
     private String pendingMode;
 
     @Override protected void onCreate(Bundle state) {
@@ -53,14 +55,39 @@ public final class MainActivity extends Activity {
         icmp6PingView = findViewById(R.id.icmp6_ping_stats);
         linkIndicator = findViewById(R.id.link_indicator);
         pathToggle = findViewById(R.id.path_toggle);
+        reliablePathToggle = findViewById(R.id.reliable_path_toggle);
     }
 
     private void configureActions() {
         pathToggle.addOnButtonCheckedListener((group, checkedId, isChecked) -> {
             if (!isChecked) return;
-            pathSupport.setText(checkedId == R.id.path_direct
-                    ? R.string.direct_support : R.string.loopback_support);
+            if (!changingPathSelection) {
+                changingPathSelection = true;
+                reliablePathToggle.clearChecked();
+                changingPathSelection = false;
+            }
+            updatePathSupport(checkedId);
         });
+        reliablePathToggle.addOnButtonCheckedListener((group, checkedId, isChecked) -> {
+            if (!isChecked) return;
+            if (!changingPathSelection) {
+                changingPathSelection = true;
+                pathToggle.clearChecked();
+                changingPathSelection = false;
+            }
+            updatePathSupport(checkedId);
+        });
+        configureModeActions();
+    }
+
+    private void updatePathSupport(int checkedId) {
+        pathSupport.setText(checkedId == R.id.path_direct
+                ? R.string.direct_support
+                : checkedId == R.id.path_rudp || checkedId == R.id.path_rtcp
+                ? R.string.reliable_usb_support : R.string.loopback_support);
+    }
+
+    private void configureModeActions() {
         findViewById(R.id.mode_ping).setOnClickListener(
                 view -> selectMode(AutVpnService.MODE_PING));
         findViewById(R.id.mode_icmp6).setOnClickListener(
@@ -169,8 +196,11 @@ public final class MainActivity extends Activity {
 
     private void startAut() {
         int checked = pathToggle.getCheckedButtonId();
+        if (checked == View.NO_ID) checked = reliablePathToggle.getCheckedButtonId();
         String path = checked == R.id.path_tcp ? "tcp"
-                : checked == R.id.path_udp ? "udp" : "direct";
+                : checked == R.id.path_udp ? "udp"
+                : checked == R.id.path_rudp ? "rudp"
+                : checked == R.id.path_rtcp ? "rtcp" : "direct";
         Intent intent = new Intent(this, AutVpnService.class)
                 .setAction(AutVpnService.ACTION_START)
                 .putExtra(AutVpnService.EXTRA_MODE, pendingMode)

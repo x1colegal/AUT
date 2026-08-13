@@ -68,7 +68,7 @@ idle.
 ### `MainActivity`
 
 Material 3 control surface. It discovers the AOA accessory, requests USB/VPN
-permission, starts modes, selects Direct/UDP/TCP, renders persisted logs and
+permission, starts modes, selects Direct/UDP/TCP/RUDP/RTCP, renders persisted logs and
 diagnostics, and exposes independent clear actions.
 
 ### `AutVpnService`
@@ -82,7 +82,7 @@ Important worker threads:
 
 | Thread | Responsibility |
 | --- | --- |
-| `aut-usb-reader` | Decode Linux-to-Android AUT frames. |
+| `aut-usb-reader` | Negotiate cleartext AUT/4, then decode binary frames. |
 | `aut-tun-reader` | Read Android TUN packets and send them toward USB. |
 | scheduler | AUTPing, ICMPv6 Ping, readiness retries, and lease timeout. |
 | `aut-shutdown` | Potentially blocking USB/TUN/relay cleanup. |
@@ -90,8 +90,8 @@ Important worker threads:
 
 ### `AutProtocol`
 
-Java counterpart to `aut_protocol.py`. Both implementations must be updated
-together when a frame type or binary rule changes.
+Java counterpart to `aut_protocol.py`. Both implement the cleartext handshake,
+nine-byte binary header, and RTCP reassembly and must be updated together.
 
 ### `LoopbackRelay`
 

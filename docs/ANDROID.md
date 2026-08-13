@@ -98,6 +98,21 @@ AUT creates a protected TCP connection on `[::1]`. Each packet receives a
 two-byte length prefix. Some Android kernels reject `VpnService.protect()` for
 local TCP sockets; use Direct or UDP when the app reports a protection error.
 
+### RUDP
+
+The TUN connects directly to the AUT bridge with no loopback socket. Every IP
+datagram becomes a dedicated `RUDP_PACKET` binary frame and keeps its boundary.
+Reliability comes from USB Bulk delivery.
+
+### RTCP
+
+The TUN also connects directly to the AUT bridge. IP packets receive a two-byte
+length prefix, enter an ordered stream, and are segmented into `RTCP_DATA`
+frames. Python rebuilds packets even across frame and USB-read boundaries.
+
+RUDP and RTCP do not call `VpnService.protect()` because they create no IP
+socket. They are direct Android-to-PC AUT/4 transports inside USB frames.
+
 ## Session lifecycle
 
 The service runs in the foreground and stores the selected mode and path. If

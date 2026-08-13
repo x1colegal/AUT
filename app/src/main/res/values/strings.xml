@@ -10,8 +10,11 @@
     <string name="direct">Direct</string>
     <string name="udp">UDP</string>
     <string name="tcp">TCP</string>
+    <string name="rudp">RUDP</string>
+    <string name="rtcp">RTCP</string>
     <string name="direct_support">Lowest overhead</string>
     <string name="loopback_support">TCP and UDP use protected [::1] sockets</string>
+    <string name="reliable_usb_support">Reliable transport carried directly inside AUT/4 USB frames</string>
     <string name="choose_mode">Choose a mode</string>
     <string name="ping_title">AUTPing only</string>
     <string name="ping_subtitle">Measure protocol and USB quality without IP or VPN</string>

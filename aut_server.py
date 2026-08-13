@@ -32,7 +32,9 @@ except ImportError:
 from aut_protocol import (
     Decoder,
     Frame,
+    HandshakeDecoder,
     ProtocolError,
+    RtcpDecoder,
     TYPE_CONFIG_REQUEST,
     TYPE_CONFIG_REQUIRED,
     TYPE_CLIENT_READY,
@@ -43,7 +45,13 @@ from aut_protocol import (
     TYPE_PING,
     TYPE_PONG,
     TYPE_SESSION_STOP,
+    TYPE_RTCP_DATA,
+    TYPE_RUDP_PACKET,
+    FLAG_END_MESSAGE,
     encode,
+    encode_handshake_response,
+    encode_rtcp_packet,
+    negotiate_request,
 )
 
 AOA_GET_PROTOCOL = 51
@@ -163,6 +171,10 @@ class BulkConnection:
 
     def write_frame(self, frame: Frame) -> None:
         self.write_frames((frame,))
+
+    def write_raw(self, wire: bytes) -> None:
+        with self.write_lock:
+            self.endpoint_out.write(wire, timeout=2000)
 
     def write_frames(self, frames) -> None:
         wire = b"".join(encode(frame) for frame in frames)
@@ -338,7 +350,7 @@ class TunGateway:
                 if not readable:
                     continue
                 packets = [os.read(fd, 65535)]
-                wire_size = len(packets[0]) + 28
+                wire_size = len(packets[0]) + 17
                 # Give a download burst a tiny window to coalesce. At high
                 # rates, a zero-time poll produced mostly one-frame libusb
                 # writes and left USB throughput on the table.
@@ -351,12 +363,12 @@ class TunGateway:
                     if not more:
                         break
                     packet = os.read(fd, 65535)
-                    if wire_size + len(packet) + 28 > 64 * 1024:
+                    if wire_size + len(packet) + 17 > 64 * 1024:
                         # Normal AUT MTUs never reach this branch because the
                         # loop stops near 60 KiB before reading another packet.
                         break
                     packets.append(packet)
-                    wire_size += len(packet) + 28
+                    wire_size += len(packet) + 17
 
                 grouped: dict[ClientSession, list[bytes]] = {}
                 with self.clients_lock:
@@ -366,7 +378,8 @@ class TunGateway:
                             grouped.setdefault(owner, []).append(packet)
                 for session, client_packets in grouped.items():
                     try:
-                        frames = [session.ip_frame(packet) for packet in client_packets]
+                        frames = [frame for packet in client_packets
+                                  for frame in session.ip_frames(packet)]
                         session.connection.write_frames(frames)
                         session.tx_packets += len(client_packets)
                     except (usb.core.USBError, OSError):
@@ -568,6 +581,10 @@ class ClientSession:
         self.key = key
         self.connection = connection
         self.decoder = Decoder()
+        self.handshake_decoder = HandshakeDecoder()
+        self.rtcp_decoder = RtcpDecoder()
+        self.handshake_complete = False
+        self.transport = "direct"
         self.client_id: str | None = None
         self.lease: ClientLease | None = None
         self.sequence = 1
@@ -587,10 +604,23 @@ class ClientSession:
             return self.client_id[:8]
         return f"usb-{self.key[0]}-{self.key[1]}"
 
-    def ip_frame(self, packet: bytes) -> Frame:
-        frame = Frame(TYPE_IP_PACKET, self.sequence, time.monotonic_ns(), packet)
-        self.sequence = (self.sequence + 1) & 0xFFFF_FFFF
+    def next_frame(self, frame_type: int, payload: bytes = b"", flags: int = 0) -> Frame:
+        frame = Frame(frame_type, self.sequence, time.monotonic_ns(), payload, flags)
+        self.sequence = (self.sequence + 1) & 0x7FFF_FFFF
         return frame
+
+    def ip_frames(self, packet: bytes) -> list[Frame]:
+        if self.transport == "rudp":
+            return [self.next_frame(TYPE_RUDP_PACKET, packet, FLAG_END_MESSAGE)]
+        if self.transport == "rtcp":
+            stream = encode_rtcp_packet(packet)
+            frames = []
+            for offset in range(0, len(stream), 16 * 1024):
+                end = min(offset + 16 * 1024, len(stream))
+                flags = FLAG_END_MESSAGE if end == len(stream) else 0
+                frames.append(self.next_frame(TYPE_RTCP_DATA, stream[offset:end], flags))
+            return frames
+        return [self.next_frame(TYPE_IP_PACKET, packet, FLAG_END_MESSAGE)]
 
     def write_control(self, frame: Frame) -> bool:
         try:
@@ -615,9 +645,8 @@ class ClientSession:
             return
         self.config_requested = True
         self.write_control(
-            Frame(TYPE_CONFIG_REQUIRED, self.sequence, time.monotonic_ns())
+            self.next_frame(TYPE_CONFIG_REQUIRED)
         )
-        self.sequence = (self.sequence + 1) & 0xFFFF_FFFF
 
     def run(self) -> None:
         print(f"[{self.label}] USB accessory ready; waiting for the AUT app", flush=True)
@@ -629,11 +658,7 @@ class ClientSession:
                     if is_usb_timeout(error):
                         continue
                     raise
-                for frame in self.decoder.feed(chunk):
-                    if not self.protocol_active:
-                        self.protocol_active = True
-                        print(f"[{self.label}] AUT protocol active", flush=True)
-                    self.handle(frame)
+                self.consume(chunk)
         except (
             usb.core.USBError, OSError, ProtocolError, RuntimeError,
             ValueError, TypeError, KeyError,
@@ -647,10 +672,64 @@ class ClientSession:
             finally:
                 self.server.remove(self.key, self)
 
+    def consume(self, chunk: bytes) -> None:
+        """Consume bytes across cleartext/binary phase transitions safely."""
+        pending = chunk
+        while pending:
+            if not self.handshake_complete:
+                handshake, pending = self.handshake_decoder.feed(pending)
+                if handshake is None:
+                    return
+                self.accept_handshake(*handshake)
+                continue
+
+            active_decoder = self.decoder
+            frames = active_decoder.feed(pending, max_frames=1)
+            pending = b""
+            if not frames:
+                return
+            self.handle(frames[0])
+            # SESSION_STOP may be followed by the next textual handshake in
+            # the same USB read. Drain the decoder that parsed this frame,
+            # even when handle() has already installed a fresh decoder.
+            pending = active_decoder.take_pending()
+
+    def accept_handshake(self, first_line: str, options: dict[str, str]) -> None:
+        try:
+            version, self.transport = negotiate_request(first_line, options)
+        except ProtocolError as error:
+            status = 505 if "version" in str(error) else 400
+            reason = "Version Not Supported" if status == 505 else "Bad Request"
+            self.connection.write_raw(encode_handshake_response(
+                "4.0", status, reason, {
+                    "Error": str(error),
+                    "Supported-Versions": "4.0",
+                },
+            ))
+            raise
+        known_options = {"versions", "transport", "mode", "framing"}
+        rejected = sorted(set(options) - known_options)
+        self.connection.write_raw(encode_handshake_response(version, 200, "OK", {
+            "Versions": f"{version}; selected",
+            "Transport": f"{self.transport}; accepted",
+            "Framing": "binary-h2; accepted",
+            "Mode": f"{options.get('mode', 'unspecified')}; accepted",
+            "Rejected-Options": ", ".join(rejected) if rejected else "none",
+            "RUDP": "supported",
+            "RTCP": "supported",
+        }))
+        self.handshake_complete = True
+        self.protocol_active = True
+        print(
+            f"[{self.label}] AUT/{version} negotiated; transport={self.transport}",
+            flush=True,
+        )
+
     def handle(self, frame: Frame) -> None:
         if frame.type == TYPE_PING:
             self.write_control(
-                Frame(TYPE_PONG, frame.sequence, frame.timestamp_ns, frame.payload)
+                Frame(TYPE_PONG, frame.sequence, frame.timestamp_ns,
+                      frame.payload, FLAG_END_MESSAGE)
             )
             self.answered += 1
             if self.answered == 1 or self.answered % 10 == 0:
@@ -669,7 +748,8 @@ class ClientSession:
             self.config_requested = False
             config = make_client_config(self.server.args, self.lease)
             delivered = self.write_control(
-                Frame(TYPE_CONFIG_RESPONSE, frame.sequence, time.monotonic_ns(), config)
+                Frame(TYPE_CONFIG_RESPONSE, frame.sequence, time.monotonic_ns(),
+                      config, FLAG_END_MESSAGE)
             )
             print(
                 f"[{self.label}] lease offered IPv4={self.lease.ipv4} "
@@ -684,7 +764,8 @@ class ClientSession:
             self.server.gateway.register(self, self.lease)
             self.registered = True
             self.write_control(
-                Frame(TYPE_CLIENT_READY_ACK, frame.sequence, time.monotonic_ns())
+                Frame(TYPE_CLIENT_READY_ACK, frame.sequence, time.monotonic_ns(),
+                      flags=FLAG_END_MESSAGE)
             )
             pending, self.pending_packets = self.pending_packets, []
             for packet in pending:
@@ -700,38 +781,67 @@ class ClientSession:
             echo_reply = icmp6_echo_reply(frame.payload, gateway6)
             if echo_reply is None:
                 raise ProtocolError("invalid ICMPv6 Echo Request")
-            self.connection.write_frame(self.ip_frame(echo_reply))
+            self.connection.write_frames(self.ip_frames(echo_reply))
             self.icmp6_replies += 1
             if self.icmp6_replies == 1 or self.icmp6_replies % 10 == 0:
                 print(
                     f"[{self.label}] ICMPv6 Echo Reply={self.icmp6_replies}",
                     flush=True,
                 )
-        elif frame.type == TYPE_IP_PACKET:
+        elif frame.type in (TYPE_IP_PACKET, TYPE_RUDP_PACKET, TYPE_RTCP_DATA):
+            if frame.type == TYPE_RUDP_PACKET and self.transport != "rudp":
+                raise ProtocolError("RUDP frame was not negotiated")
+            if frame.type == TYPE_RTCP_DATA and self.transport != "rtcp":
+                raise ProtocolError("RTCP frame was not negotiated")
+            if frame.type == TYPE_IP_PACKET and self.transport in ("rudp", "rtcp"):
+                raise ProtocolError("plain IP frame does not match negotiated transport")
+            packets = (self.rtcp_decoder.feed(frame.payload)
+                       if frame.type == TYPE_RTCP_DATA else [frame.payload])
+            for packet in packets:
+                self.handle_ip_packet(packet)
+        elif frame.type == TYPE_SESSION_STOP:
+            old_label = self.label
+            self.reset_for_handshake()
+            print(
+                f"[{old_label}] session stopped; waiting for a new AUT handshake",
+                flush=True,
+            )
+        else:
+            print(f"[{self.label}] ignored frame type={frame.type} seq={frame.sequence}")
+
+    def reset_for_handshake(self) -> None:
+        """Return a reusable USB accessory connection to AUT's text phase."""
+        self.server.gateway.unregister(self)
+        self.decoder = Decoder()
+        self.handshake_decoder = HandshakeDecoder()
+        self.rtcp_decoder = RtcpDecoder()
+        self.handshake_complete = False
+        self.protocol_active = False
+        self.transport = "direct"
+        self.client_id = None
+        self.lease = None
+        self.registered = False
+        self.config_requested = False
+        self.pending_packets.clear()
+
+    def handle_ip_packet(self, packet: bytes) -> None:
             if not self.registered:
                 if self.lease is None:
                     self.request_config()
                     self.note_drop("client registration is being restored")
                 else:
                     if len(self.pending_packets) < 128:
-                        self.pending_packets.append(frame.payload)
+                        self.pending_packets.append(packet)
                     else:
                         self.note_drop("CLIENT_READY queue is full")
                 return
-            self.server.gateway.write_packet(self, frame.payload)
+            self.server.gateway.write_packet(self, packet)
             if self.rx_packets == 1 or self.rx_packets % 1000 == 0:
                 print(
                     f"[{self.label}] dataplane android->aut0={self.rx_packets} "
                     f"aut0->android={self.tx_packets}",
                     flush=True,
                 )
-        elif frame.type == TYPE_SESSION_STOP:
-            self.server.gateway.unregister(self)
-            self.registered = False
-            self.pending_packets.clear()
-            print(f"[{self.label}] session stopped; USB remains available", flush=True)
-        else:
-            print(f"[{self.label}] ignored frame type={frame.type} seq={frame.sequence}")
 
 
 class AutServer:
@@ -784,7 +894,7 @@ class AutServer:
 
     def run(self) -> None:
         print(
-            "AUT/3 multiclient server ready; connect any AOA-capable Android device. "
+            "AUT/4 multiclient server ready; connect any AOA-capable Android device. "
             f"USB downlink batching={self.args.usb_batch_ms:g} ms. Press Ctrl+C to stop.",
             flush=True,
         )
