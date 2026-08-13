@@ -30,6 +30,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -66,6 +67,10 @@ public final class AutVpnService extends VpnService {
     private final int icmp6Identifier = new SecureRandom().nextInt(0x10000);
 
     private volatile boolean running;
+    private volatile boolean desiredActive;
+    private int reconnectAttempt;
+    private ScheduledExecutorService reconnectExecutor;
+    private ScheduledFuture<?> reconnectFuture;
     private boolean pingEnabled;
     private boolean internetEnabled;
     private boolean routeInternetEnabled;
@@ -90,19 +95,25 @@ public final class AutVpnService extends VpnService {
     @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
+        reconnectExecutor = Executors.newSingleThreadScheduledExecutor();
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_CLEAR_DIAGNOSTICS.equals(intent.getAction())) {
             clearDiagnostics();
-            if (!running) stopSelf();
-            return running ? START_STICKY : START_NOT_STICKY;
+            if (!desiredActive) stopSelf();
+            return desiredActive ? START_STICKY : START_NOT_STICKY;
         }
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            desiredActive = false;
+            cancelReconnect();
             status("AUT stopped");
             shutdownAsync(true);
             return START_NOT_STICKY;
         }
+        desiredActive = true;
+        cancelReconnect();
+        reconnectAttempt = 0;
         if (running) shutdown(true);
         String mode = intent == null
                 ? getPreferences().getString(PREF_MODE, MODE_INTERNET)
@@ -138,7 +149,8 @@ public final class AutVpnService extends VpnService {
         }
         startForeground(NOTIFICATION_ID, notification("Connecting to USB…"));
         int generation = sessionGeneration.incrementAndGet();
-        startTransport(generation);
+        running = true;
+        startTransportSafely(generation);
         return START_REDELIVER_INTENT;
     }
 
@@ -147,18 +159,18 @@ public final class AutVpnService extends VpnService {
     }
 
     private void startTransport(int generation) {
+        if (!desiredActive || !isCurrent(generation)) return;
         UsbManager manager = (UsbManager) getSystemService(USB_SERVICE);
         UsbAccessory[] list = manager.getAccessoryList();
         if (list == null || list.length == 0) {
-            fail("AUT USB accessory not found", generation);
+            connectionLost("AUT USB accessory not found", generation);
             return;
         }
         accessoryFd = manager.openAccessory(list[0]);
         if (accessoryFd == null) {
-            fail("USB permission is missing or the accessory is busy", generation);
+            connectionLost("USB permission is missing or the accessory is busy", generation);
             return;
         }
-        running = true;
         clientReadyAcknowledged = false;
         handshakeComplete = false;
         ratp = new RatpTransport();
@@ -173,9 +185,17 @@ public final class AutVpnService extends VpnService {
                 + transportProtocol.toUpperCase(Locale.US));
         scheduler.schedule(() -> {
             if (isCurrent(generation) && !handshakeComplete) {
-                fail("AUT handshake timeout", generation);
+                connectionLost("AUT handshake timeout", generation);
             }
         }, 6, TimeUnit.SECONDS);
+    }
+
+    private void startTransportSafely(int generation) {
+        try {
+            startTransport(generation);
+        } catch (Exception error) {
+            connectionLost("AUT connection error: " + usefulMessage(error), generation);
+        }
     }
 
     private void onHandshakeComplete(int generation) throws Exception {
@@ -192,10 +212,12 @@ public final class AutVpnService extends VpnService {
             sendFrame(AutProtocol.CONFIG_REQUEST, configRequest(), generation);
             scheduler.schedule(() -> {
                 if (isCurrent(generation) && tunFd == null) {
-                    fail("Gateway timeout — no DHCP/SLAAC lease received", generation);
+                    connectionLost(
+                            "Gateway timeout — no DHCP/SLAAC lease received", generation);
                 }
             }, 6, TimeUnit.SECONDS);
         } else status("AUT/" + AutProtocol.VERSION + " Ping-only link active");
+        if (!internetEnabled) markConnectionStable();
     }
 
     private byte[] configRequest() {
@@ -256,7 +278,7 @@ public final class AutVpnService extends VpnService {
             }
         } catch (Exception error) {
             if (isCurrent(generation)) {
-                fail("USB I/O error: " + usefulMessage(error), generation);
+                connectionLost("AUT connection error: " + usefulMessage(error), generation);
             }
         }
     }
@@ -280,7 +302,7 @@ public final class AutVpnService extends VpnService {
                 sendEncoded(AutProtocol.encode(frame), generation);
             }
         } catch (Exception error) {
-            fail("RATP error: " + usefulMessage(error), generation);
+            connectionLost("RATP error: " + usefulMessage(error), generation);
         }
     }
 
@@ -322,6 +344,7 @@ public final class AutVpnService extends VpnService {
             sendFrame(AutProtocol.CONFIG_REQUEST, configRequest(), generation);
         } else if (frame.type == AutProtocol.CLIENT_READY_ACK && internetEnabled) {
             clientReadyAcknowledged = true;
+            markConnectionStable();
             status(routeInternetEnabled
                     ? "Internet active · "
                             + packetPathDescription()
@@ -422,7 +445,7 @@ public final class AutVpnService extends VpnService {
             }
         } catch (IOException error) {
             if (isCurrent(generation)) {
-                fail("VPN I/O error: " + usefulMessage(error), generation);
+                connectionLost("VPN I/O error: " + usefulMessage(error), generation);
             }
         }
     }
@@ -433,7 +456,7 @@ public final class AutVpnService extends VpnService {
             try {
                 sendEncoded(AutProtocol.encode(ratp.sendPacket(packet)), generation);
             } catch (IOException error) {
-                fail("RATP send error: " + usefulMessage(error), generation);
+                connectionLost("RATP send error: " + usefulMessage(error), generation);
                 return;
             }
         } else sendFrame(AutProtocol.IP_PACKET, AutProtocol.END_MESSAGE, packet, generation);
@@ -596,7 +619,7 @@ public final class AutVpnService extends VpnService {
             }
         } catch (IOException error) {
             if (isCurrent(generation)) {
-                fail("USB write error: " + usefulMessage(error), generation);
+                connectionLost("USB write error: " + usefulMessage(error), generation);
             }
         }
     }
@@ -611,9 +634,53 @@ public final class AutVpnService extends VpnService {
 
     private synchronized void fail(String message, int generation) {
         if (!isCurrent(generation)) return;
+        desiredActive = false;
+        cancelReconnect();
         status(message);
         shutdown(false);
         stopSelf();
+    }
+
+    private void connectionLost(String message, int generation) {
+        synchronized (this) {
+            if (!isCurrent(generation) || !desiredActive) return;
+            running = false;
+            handshakeComplete = false;
+            clientReadyAcknowledged = false;
+            sessionGeneration.incrementAndGet();
+        }
+        status(message + " — reconnecting automatically");
+        new Thread(() -> {
+            cleanupSession(false);
+            scheduleReconnect();
+        }, "aut-reconnect-cleanup").start();
+    }
+
+    private synchronized void scheduleReconnect() {
+        if (!desiredActive || reconnectExecutor == null || reconnectExecutor.isShutdown()) return;
+        reconnectAttempt++;
+        cancelReconnect();
+        reconnectFuture = reconnectExecutor.schedule(() -> {
+            synchronized (AutVpnService.this) {
+                reconnectFuture = null;
+                if (!desiredActive || running) return;
+                running = true;
+            }
+            int generation = sessionGeneration.incrementAndGet();
+            status("Reconnect attempt " + reconnectAttempt + " · "
+                    + transportProtocol.toUpperCase(Locale.US));
+            startTransportSafely(generation);
+        }, 0, TimeUnit.MILLISECONDS);
+    }
+
+    private synchronized void cancelReconnect() {
+        if (reconnectFuture != null) reconnectFuture.cancel(false);
+        reconnectFuture = null;
+    }
+
+    private synchronized void markConnectionStable() {
+        if (reconnectAttempt > 0) status("AUT connection restored automatically");
+        reconnectAttempt = 0;
     }
 
     private void shutdownAsync(boolean notifyPeer) {
@@ -651,6 +718,10 @@ public final class AutVpnService extends VpnService {
         handshakeComplete = false;
         clientReadyAcknowledged = false;
         sessionGeneration.incrementAndGet();
+        cleanupSession(true);
+    }
+
+    private synchronized void cleanupSession(boolean removeForeground) {
         if (scheduler != null) scheduler.shutdownNow();
         scheduler = null;
         close(tunInput); close(tunOutput); close(tunFd);
@@ -658,8 +729,13 @@ public final class AutVpnService extends VpnService {
         tunInput = null; tunOutput = null; tunFd = null;
         usbInput = null; usbOutput = null; accessoryFd = null;
         pings.clear();
-        if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
-        else stopForeground(true);
+        icmp6Pings.clear();
+        clientIpv6 = null;
+        gatewayIpv6 = null;
+        if (removeForeground) {
+            if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE);
+            else stopForeground(true);
+        }
     }
 
     private static String usefulMessage(Exception error) {
@@ -693,12 +769,16 @@ public final class AutVpnService extends VpnService {
     }
 
     @Override public void onRevoke() {
+        desiredActive = false;
+        cancelReconnect();
         status("VPN permission revoked");
         shutdownAsync(true);
     }
 
     @Override public void onDestroy() {
+        cancelReconnect();
         shutdown(running);
+        if (reconnectExecutor != null) reconnectExecutor.shutdownNow();
         super.onDestroy();
     }
 

@@ -26,6 +26,7 @@ internet connection.
 - Test a complete checksummed ICMPv6 Echo Request/Reply.
 - Choose either the lowest-overhead Direct path or reliable USB-native RATP.
 - Reconnect clients and restore sessions without restarting the server.
+- Reopen USB and rebuild the VPN automatically after an I/O failure.
 
 ## How it fits together
 

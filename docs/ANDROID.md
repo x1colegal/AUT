@@ -104,6 +104,14 @@ then removes the session from the shared dispatcher without treating the close
 as a fault. Blocking USB/TUN cleanup happens on an `aut-shutdown` worker instead
 of Android's main thread to avoid application-not-responding dialogs.
 
+An unexpected USB, TUN, RATP, handshake, lease, or protocol error does not stop
+the selected mode. AUT immediately closes the broken descriptors and attempts
+to reopen USB with the same mode and Direct/RATP selection. It renegotiates
+AUT/4, requests the lease again, recreates the TUN, and resumes forwarding
+without another user tap. Failed attempts retry immediately with no backoff.
+Only an explicit **Stop AUT**, a mode change, or revoked VPN permission cancels
+the current recovery cycle.
+
 The latest 80 activity entries are persisted in app preferences. Closing and
 reopening the activity does not erase them. **Clear history** removes activity
 entries; **Clear diagnostics** resets ping counters independently.
